@@ -20,11 +20,14 @@
 #pragma once
 
 #include <fs/file.h>
+#include <fs/virtual.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
 void console_init();
 int console_fork(HANDLE process);
+void console_afterfork();
 
+struct virtualfs_custom_desc console_desc;
 struct file *console_alloc();

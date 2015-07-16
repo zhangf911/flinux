@@ -18,12 +18,15 @@
  */
 
 #include <common/errno.h>
-#include <core/forward_list.h>
+#include <dbt/x86.h>
+#include <lib/rbtree.h>
+#include <lib/slist.h>
 #include <syscall/mm.h>
 #include <syscall/syscall.h>
 #include <syscall/vfs.h>
 #include <log.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -47,109 +50,6 @@
  *     MAP_FIXED with MAP_SHARED or MAP_PRIVATE on non 64kB aligned address.
  */
 
-/* Overall memory layout (x86)
- *
- * FFFFFFFF ------------------------------
- * ...        Win32 kernel address space
- * ...         (unused if 4gt enabled)
- * 80000000 ------------------------------
- * ...                win32 dlls
- * 73000000 ------------------------------
- * ...        Foreign Linux kernel data
- * 70000000 ------------------------------
- * ...
- * ...          Application code/data
- * ...
- * 04000000 ------------------------------
- * ...            Win32 system heaps
- * ...        Foreign Linux kernel code
- * 00000000 ------------------------------
- *
- *
- * Foreign Linux kernel data memory layout (x86), u for unmappable
- *
- * 73000000 ------------------------------
- *                 dbt code cache (u)
- * 72800000 ------------------------------
- *                dbt blocks table (u)
- * 72000000 ------------------------------
- *                    kernel heap
- * 71000000 ------------------------------
- *                fork_info structure
- * 70FF0000 ------------------------------
- *             startup (argv, env) data
- * 70FE0000 ------------------------------
- *                tls_data structure
- * 70FD0000 ------------------------------
- *              mm_heap_data structure
- * 70FC0000 ------------------------------
- *              console_data structure
- * 70FB0000 ------------------------------
- *                vfs_data structure
- * 70900000 ------------------------------
- *               dbt_data structure (u)
- * 70800000 ------------------------------
- *             process_data structure (u)
- * 70700000 ------------------------------
- *                 section handles (u)
- * 70200000 ------------------------------
- *                mm_data structure (u)
- * 70000000 ------------------------------
- */
-
-/* Overall memory layout (x64)
- * TODO: This hasn't been updated for a long time since the introduction of DBT.
- * Need redesign once we want to support x64 again.
- *
- * FFFFFFFF FFFFFFFF ------------------------------
- * ...                 Win32 kernel address space
- * FFFF8000 00000000 ------------------------------
- * ...                         (unusable)
- * 00007FFF FFFFFFFF ------------------------------
- *                             Win32 dlls
- * 00007FF0 00000000 ------------------------------
- *                      (unused in Foreign Linux)
- *                    we reduce the available address space to limit the size of section handles store
- * 00001000 00000000 ------------------------------
- * ...                   Application code/data
- * 00000003 00000000 ------------------------------  <-- brk base (x64 special to avoid collisions in low address)
- * ...                   Application code/data
- * 00000002 00000000 ------------------------------
- * ...                 Foreign Linux kernel code
- * 00000001 00000000 ------------------------------
- * ...                 Foreign Linux kernel data
- * 00000000 20000000 ------------------------------
- * ...                     Win32 system heaps
- * 00000000 10400000 ------------------------------
- * ...                      Application code
- * 00000000 00400000 ------------------------------
- *                         Win32 system heaps
- * 00000000 00000000 ------------------------------
- *
- *
- * Foreign Linux kernel data memory layout (x64), u for unmappable
- *
- * 00000001 00000000 ------------------------------
- *                             kernel heap
- * 00000000 F0000000 ------------------------------
- *                         fork_info structure
- * 00000000 EFFF0000 ------------------------------
- *                      startup (argv, env) data
- * 00000000 EFFE0000 ------------------------------
- *                         tls_data structure
- * 00000000 EFFD0000 ------------------------------
- *                         vfs_data structure
- * 00000000 EE000000 ------------------------------
- *                        mm_heap_data structure
- * 00000000 ED000000 ------------------------------
- *                      process_data structure (u)
- * 00000000 EC000000 ------------------------------
- *                         section handles (u)
- * 00000000 30000000 ------------------------------
- *                        mm_data structure (u)
- * 00000000 20000000 ------------------------------
- */
-
 /* Hard limits */
 /* Maximum number of mmap()-ed areas */
 #define MAX_MMAP_COUNT 65535
@@ -164,10 +64,6 @@
 #define ADDRESS_ALLOCATION_LOW	0x0000000200000000ULL
 /* The highest non fixed allocation address we can make */
 #define ADDRESS_ALLOCATION_HIGH	0x0001000000000000ULL
-/* The lowest address of reserved kernel data */
-#define ADDRESS_RESERVED_LOW	0x0000000020000000ULL
-/* The highest address of reserved kernel data */
-#define ADDRESS_RESERVED_HIGH	0x0000000100000000ULL
 
 #else
 
@@ -179,10 +75,6 @@
 #define ADDRESS_ALLOCATION_LOW	0x10000000U
 /* The highest non fixed allocation address we can make */
 #define ADDRESS_ALLOCATION_HIGH	0x70000000U
-/* The lowest address of reserved kernel data */
-#define ADDRESS_RESERVED_LOW	0x70000000U
-/* The highest address of reserved kernel data */
-#define ADDRESS_RESERVED_HIGH	0x72000000U
 
 #endif
 
@@ -214,28 +106,58 @@
 
 struct map_entry
 {
-	FORWARD_LIST_NODE(struct map_entry);
-	size_t start_page;
-	size_t end_page;
-	int prot;
-	struct file *f;
-	off_t offset_pages;
+	struct rb_node tree;
+	union
+	{
+		struct slist free_list;
+		struct
+		{
+			size_t start_page;
+			size_t end_page;
+			int prot, flags;
+			struct file *f;
+			off_t offset_pages;
+		};
+	};
 };
+
+static int map_entry_cmp(const struct rb_node *l, const struct rb_node *r)
+{
+	struct map_entry *left = rb_entry(l, struct map_entry, tree);
+	struct map_entry *right = rb_entry(r, struct map_entry, tree);
+	if (left->start_page == right->start_page)
+		return 0;
+	else if (left->start_page < right->start_page)
+		return -1;
+	else
+		return 1;
+}
 
 struct mm_data
 {
+	/* RW lock for multi-threading protection */
+	SRWLOCK rw_lock;
+
 	/* Program break address, brk() will use this */
 	void *brk;
 
+	/* Used for mm_static_alloc() */
+	void *static_alloc_begin, *static_alloc_end;
+
+	/* Used for mm_global_shared_alloc() */
+	HANDLE global_shared_section;
+	void *global_shared_alloc_begin, *global_shared_alloc_end;
+
 	/* Information for all existing mappings */
-	FORWARD_LIST(struct map_entry) map_list, map_free_list;
-	struct map_entry map_entries[MAX_MMAP_COUNT];
+	struct rb_tree entry_tree;
+	struct slist entry_free_list;
+	struct map_entry entries[MAX_MMAP_COUNT];
 
 	/* Section handle count for each table */
 	uint16_t section_table_handle_count[SECTION_TABLE_COUNT];
-};
-static struct mm_data *const mm = MM_DATA_BASE;
-static HANDLE *mm_section_handle = MM_SECTION_HANDLE_BASE;
+} _mm;
+static struct mm_data *const mm = &_mm;
+static HANDLE *mm_section_handle;
 
 static __forceinline HANDLE get_section_handle(size_t i)
 {
@@ -253,7 +175,7 @@ static __forceinline void add_section_handle(size_t i, HANDLE handle)
 		mm_section_handle[i] = handle;
 	else
 	{
-		VirtualAlloc(&mm_section_handle[t * SECTION_HANDLE_PER_TABLE], BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		VirtualAlloc(&mm_section_handle[t * SECTION_HANDLE_PER_TABLE], BLOCK_SIZE, MEM_COMMIT, PAGE_READWRITE);
 		mm_section_handle[i] = handle;
 	}
 }
@@ -268,31 +190,42 @@ static __forceinline void remove_section_handle(size_t i)
 	mm_section_handle[i] = NULL;
 	size_t t = GET_SECTION_TABLE(i);
 	if (--mm->section_table_handle_count[t] == 0)
-		VirtualFree(&mm_section_handle[t * SECTION_HANDLE_PER_TABLE], BLOCK_SIZE, MEM_RELEASE);
+		VirtualFree(&mm_section_handle[t * SECTION_HANDLE_PER_TABLE], BLOCK_SIZE, MEM_DECOMMIT);
 }
 
 static struct map_entry *new_map_entry()
 {
-	if (forward_list_empty(&mm->map_free_list))
+	if (slist_empty(&mm->entry_free_list))
 		return NULL;
-	struct map_entry *entry = forward_list_next(&mm->map_free_list);
-	forward_list_remove(&mm->map_free_list, entry);
+	struct map_entry *entry = slist_next_entry(&mm->entry_free_list, struct map_entry, free_list);
+	slist_remove(&mm->entry_free_list, &entry->free_list);
 	return entry;
 }
 
 static void free_map_entry(struct map_entry *entry)
 {
-	forward_list_add(&mm->map_free_list, entry);
+	slist_add(&mm->entry_free_list, &entry->free_list);
+}
+
+static struct rb_node *start_node(size_t start_page)
+{
+	struct map_entry probe;
+	probe.start_page = start_page;
+	struct rb_node *node = rb_upper_bound(&mm->entry_tree, &probe.tree, map_entry_cmp);
+	if (node)
+		return node;
+	return rb_lower_bound(&mm->entry_tree, &probe.tree, map_entry_cmp);
 }
 
 static struct map_entry *find_map_entry(void *addr)
 {
-	struct map_entry *p, *e;
-	forward_list_iterate(&mm->map_list, p, e)
-		if (addr < GET_PAGE_ADDRESS(e->start_page))
-			return NULL;
-		else if (addr < GET_PAGE_ADDRESS(e->end_page + 1))
-			return e;
+	struct map_entry probe, *entry;
+	size_t page = GET_PAGE(addr);
+	probe.start_page = page;
+	entry = rb_entry(rb_upper_bound(&mm->entry_tree, &probe.tree, map_entry_cmp), struct map_entry, tree);
+	/* upper bound condition: block->start_page <= page */
+	if (page <= entry->end_page)
+		return entry;
 	return NULL;
 }
 
@@ -308,34 +241,42 @@ static void split_map_entry(struct map_entry *e, size_t last_page_of_first_entry
 	}
 	ne->prot = e->prot;
 	e->end_page = last_page_of_first_entry;
-	forward_list_add(e, ne);
+	rb_add(&mm->entry_tree, &ne->tree, map_entry_cmp);
 }
 
-static void free_map_entry_blocks(struct map_entry *p, struct map_entry *e)
+static void free_map_entry_blocks(struct map_entry *e)
 {
+	if (e->flags & INTERNAL_MAP_COPYONFORK)
+	{
+		VirtualFree(GET_PAGE_ADDRESS(e->start_page), 0, MEM_RELEASE);
+		return;
+	}
 	if (e->f)
 		vfs_release(e->f);
-	struct map_entry *n = forward_list_next(e);
+	struct rb_node *prev = rb_prev(&e->tree);
+	struct rb_node *next = rb_next(&e->tree);
 	size_t start_block = GET_BLOCK_OF_PAGE(e->start_page);
 	size_t end_block = GET_BLOCK_OF_PAGE(e->end_page);
-	if (p != &mm->map_list && GET_BLOCK_OF_PAGE(p->end_page) == start_block)
+
+	/* The first block and last block may be shared with previous/next entry
+	 * We should mark corresponding pages in such blocks as PAGE_NOACCESS instead of free them */
+	if (prev && GET_BLOCK_OF_PAGE(rb_entry(prev, struct map_entry, tree)->end_page) == start_block)
 	{
-		/* First block is still in use, make it inaccessible */
+		/* First block is shared, just make it inaccessible */
 		size_t last_page = GET_LAST_PAGE_OF_BLOCK(GET_BLOCK_OF_PAGE(e->start_page));
-		if (n && GET_BLOCK_OF_PAGE(n->start_page) == start_block)
-			last_page = n->start_page - 1;
+		last_page = min(last_page, e->end_page); /* The entry may occupy only a block */
 		DWORD oldProtect;
 		VirtualProtect(GET_PAGE_ADDRESS(e->start_page), (last_page - e->start_page + 1) * PAGE_SIZE, PAGE_NOACCESS, &oldProtect);
 		start_block++;
 	}
-	if (end_block >= start_block && n && GET_BLOCK_OF_PAGE(n->start_page) == end_block)
+	if (end_block >= start_block && next && GET_BLOCK_OF_PAGE(rb_entry(next, struct map_entry, tree)->start_page) == end_block)
 	{
-		/* Last block is still in use, make it inaccessible */
+		/* Last block is shared, just make it inaccessible */
 		DWORD oldProtect;
 		VirtualProtect(GET_BLOCK_ADDRESS(end_block), GET_SIZE_OF_BLOCK_TO_PAGE(e->end_page + 1), PAGE_NOACCESS, &oldProtect);
 		end_block--;
 	}
-	/* Unmap other full blocks */
+	/* Unmap non-shared full blocks */
 	for (size_t i = start_block; i <= end_block; i++)
 	{
 		HANDLE handle = get_section_handle(i);
@@ -348,32 +289,66 @@ static void free_map_entry_blocks(struct map_entry *p, struct map_entry *e)
 	}
 }
 
+static void map_global_shared_section()
+{
+	mm->global_shared_alloc_begin = MapViewOfFile(mm->global_shared_section,
+		FILE_MAP_ALL_ACCESS, 0, 0, MM_GLOBAL_SHARED_ALLOC_SIZE);
+	if (mm->global_shared_alloc_begin == NULL)
+	{
+		log_error("mm: Map global shared area failed, error code: %d.\n", GetLastError());
+		process_exit(1, 0);
+	}
+	mm->global_shared_alloc_end = (char*)mm->global_shared_alloc_begin + MM_GLOBAL_SHARED_ALLOC_SIZE;
+}
+
 void mm_init()
 {
-	VirtualAlloc(MM_DATA_BASE, sizeof(struct mm_data), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	/* Initialize RW lock */
+	InitializeSRWLock(&mm->rw_lock);
 	/* Initialize mapping info freelist */
-	forward_list_init(&mm->map_list);
-	forward_list_init(&mm->map_free_list);
+	rb_init(&mm->entry_tree);
+	slist_init(&mm->entry_free_list);
 	for (size_t i = 0; i + 1 < MAX_MMAP_COUNT; i++)
-		forward_list_add(&mm->map_free_list, &mm->map_entries[i]);
+		slist_add(&mm->entry_free_list, &mm->entries[i].free_list);
 	mm->brk = 0;
+	/* Initialize section handle table */
+	mm_section_handle = VirtualAlloc(NULL, BLOCK_COUNT * sizeof(HANDLE), MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
+	/* Initialize static alloc */
+	mm->static_alloc_begin = mm_mmap(NULL, MM_STATIC_ALLOC_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS,
+		INTERNAL_MAP_TOPDOWN | INTERNAL_MAP_NORESET | INTERNAL_MAP_COPYONFORK, NULL, 0);
+	mm->static_alloc_end = (uint8_t*)mm->static_alloc_begin + MM_STATIC_ALLOC_SIZE;
+	/* Initialize global shared alloc */
+	LPCWSTR section_name = L"flinux_global_shared";
+	LARGE_INTEGER size;
+	size.QuadPart = MM_GLOBAL_SHARED_ALLOC_SIZE;
+	SECURITY_ATTRIBUTES attr;
+	attr.nLength = sizeof(SECURITY_ATTRIBUTES);
+	attr.bInheritHandle = TRUE;
+	attr.lpSecurityDescriptor = NULL;
+	mm->global_shared_section = CreateFileMappingW(INVALID_HANDLE_VALUE, &attr, PAGE_READWRITE,
+		size.HighPart, size.LowPart, section_name);
+	if (mm->global_shared_section == NULL)
+	{
+		log_error("mm: Create global shared area failed, error code: %d.\n", GetLastError());
+		process_exit(1, 0);
+	}
+	map_global_shared_section();
 }
 
 void mm_reset()
 {
 	/* Release all user memory */
 	size_t last_block = 0;
-	size_t reserved_start = GET_BLOCK(ADDRESS_RESERVED_LOW);
-	size_t reserved_end = GET_BLOCK(ADDRESS_RESERVED_HIGH) - 1;
-	struct map_entry *p, *e;
-	forward_list_iterate_safe(&mm->map_list, p, e)
+	for (struct rb_node *cur = rb_first(&mm->entry_tree); cur;)
 	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		size_t start_block = GET_BLOCK_OF_PAGE(e->start_page);
 		size_t end_block = GET_BLOCK_OF_PAGE(e->end_page);
-		if (reserved_start <= start_block && start_block <= reserved_end)
+		if (e->flags & INTERNAL_MAP_NORESET)
+		{
+			cur = rb_next(cur);
 			continue;
-		if (reserved_start <= end_block && end_block <= reserved_end)
-			continue;
+		}
 
 		if (start_block == last_block)
 			start_block++;
@@ -391,8 +366,10 @@ void mm_reset()
 
 		if (e->f)
 			vfs_release(e->f);
-		forward_list_remove(p, e);
 		free_map_entry(e);
+		struct rb_node *next = rb_next(cur);
+		rb_remove(&mm->entry_tree, cur);
+		cur = next;
 	}
 	mm->brk = 0;
 }
@@ -409,7 +386,35 @@ void mm_shutdown()
 			remove_section_handle(i);
 		}
 	}
-	VirtualFree(mm, 0, MEM_RELEASE);
+	VirtualFree(mm_section_handle, 0, MEM_RELEASE);
+}
+
+void *mm_static_alloc(size_t size)
+{
+	if ((uint8_t*)mm->static_alloc_begin + size > mm->static_alloc_end)
+	{
+		log_error("mm_static_alloc(): Overlarge static block size, remain: %p, requested: %p\n",
+			(uint8_t*)mm->static_alloc_end - (uint8_t*)mm->static_alloc_begin, size);
+		log_error("Please enlarge MM_STATIC_ALLOC_SIZE manually.\n");
+		__debugbreak();
+	}
+	void *ret = mm->static_alloc_begin;
+	mm->static_alloc_begin = (void*)ALIGN_TO((uint8_t*)mm->static_alloc_begin + size, 16);
+	return ret;
+}
+
+void *mm_global_shared_alloc(size_t size)
+{
+	if ((uint8_t*)mm->global_shared_alloc_begin + size > mm->global_shared_alloc_end)
+	{
+		log_error("mm_global_shared_alloc(): Overlarge static block size, remain: %p, requested: %p\n",
+			(uint8_t*)mm->global_shared_alloc_end - (uint8_t*)mm->global_shared_alloc_begin, size);
+		log_error("Please enlarge MM_GLOBAL_SHARED_ALLOC_SIZE manually.\n");
+		__debugbreak();
+	}
+	void *ret = mm->global_shared_alloc_begin;
+	mm->global_shared_alloc_begin = (void*)ALIGN_TO((uint8_t*)mm->global_shared_alloc_begin + size, 16);
+	return ret;
 }
 
 void mm_update_brk(void *brk)
@@ -418,30 +423,66 @@ void mm_update_brk(void *brk)
 #ifdef _WIN64
 	mm->brk = MM_BRK_BASE;
 #else
-	mm->brk = max(mm->brk, ALIGN_TO_PAGE(brk));
+	mm->brk = (void*)max((size_t)mm->brk, ALIGN_TO_PAGE(brk));
 #endif
 }
 
-/* Find 'count' consecutive free pages in address range [low, high), return 0 if not found */
-static size_t find_free_pages(size_t count, size_t low, size_t high)
+/* Find 'count' consecutive free pages, return 0 if not found */
+static size_t find_free_pages(size_t count, bool block_align)
 {
-	size_t last = GET_PAGE(low);
-	struct map_entry *p, *e;
-	forward_list_iterate(&mm->map_list, p, e)
-		if (e->start_page >= GET_PAGE(low))
-			if (e->start_page - last >= count)
-				return last;
-			else
-				last = e->end_page + 1;
-	if (GET_PAGE(high) - last >= count)
+	size_t last = GET_PAGE(ADDRESS_ALLOCATION_LOW);
+	for (struct rb_node *cur = rb_first(&mm->entry_tree); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
+		if (e->start_page >= last && e->start_page - last >= count)
+			return last;
+		else if (e->end_page >= last)
+		{
+			last = e->end_page + 1;
+			/* MAP_SHARED entries always occupy entire blocks */
+			if (block_align || (e->flags & INTERNAL_MAP_SHARED))
+				last = (last + PAGES_PER_BLOCK - 1) & -PAGES_PER_BLOCK;
+		}
+		if (last >= GET_PAGE(ADDRESS_ALLOCATION_HIGH))
+			return 0;
+	}
+	if (GET_PAGE(ADDRESS_ALLOCATION_HIGH) > last && GET_PAGE(ADDRESS_ALLOCATION_HIGH) - last >= count)
 		return last;
+	else
+		return 0;
+}
+
+/* Find 'count' consecutive free pages at the highest possible address with, return 0 if not found */
+static size_t find_free_pages_topdown(size_t count, bool block_align)
+{
+	size_t last = GET_PAGE(ADDRESS_ALLOCATION_HIGH);
+	for (struct rb_node *cur = rb_last(&mm->entry_tree); cur; cur = rb_prev(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
+		size_t end_page = e->end_page;
+		/* MAP_SHARED entries always occupy entire blocks */
+		if (e->flags & INTERNAL_MAP_SHARED)
+			end_page = (end_page & -PAGES_PER_BLOCK) + (PAGES_PER_BLOCK - 1);
+		if (e->end_page < last && e->end_page + count < last)
+			return last - count;
+		else if (e->start_page < last)
+		{
+			last = e->start_page;
+			if (block_align)
+				last &= -PAGES_PER_BLOCK;
+		}
+		if (last <= GET_PAGE(ADDRESS_ALLOCATION_LOW))
+			return 0;
+	}
+	if (GET_PAGE(ADDRESS_ALLOCATION_LOW) < last && GET_PAGE(ADDRESS_ALLOCATION_LOW) + count < last)
+		return last - count;
 	else
 		return 0;
 }
 
 size_t mm_find_free_pages(size_t count_bytes)
 {
-	return find_free_pages(GET_PAGE(ALIGN_TO_PAGE(count_bytes)), ADDRESS_ALLOCATION_LOW, ADDRESS_ALLOCATION_HIGH);
+	return find_free_pages(GET_PAGE(ALIGN_TO_PAGE(count_bytes)), false);
 }
 
 static DWORD prot_linux2win(int prot)
@@ -503,10 +544,14 @@ void mm_dump_windows_memory_mappings(HANDLE process)
 
 void mm_dump_memory_mappings()
 {
-	struct map_entry *p, *e;
+	AcquireSRWLockShared(&mm->rw_lock);
 	log_info("Current memory mappings...\n");
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = rb_first(&mm->entry_tree); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		log_info("0x%p - 0x%p: PROT: %d\n", GET_PAGE_ADDRESS(e->start_page), GET_PAGE_ADDRESS(e->end_page), e->prot);
+	}
+	ReleaseSRWLockShared(&mm->rw_lock);
 }
 
 static void map_entry_range(struct map_entry *e, size_t start_page, size_t end_page)
@@ -730,8 +775,9 @@ static int handle_cow_page_fault(void *addr)
 	/* We're the only owner of the section now, change page protection flags */
 	size_t start_page = GET_FIRST_PAGE_OF_BLOCK(block);
 	size_t end_page = GET_LAST_PAGE_OF_BLOCK(block);
-	struct map_entry *p, *e;
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (end_page < e->start_page)
 			break;
 		else
@@ -748,6 +794,7 @@ static int handle_cow_page_fault(void *addr)
 				return 0;
 			}
 		}
+	}
 	log_info("CoW section %p successfully duplicated.\n", block);
 	return 1;
 }
@@ -762,7 +809,9 @@ static int handle_on_demand_page_fault(void *addr)
 	struct map_entry *p, *e;
 	int found = 0;
 	allocate_block(block);
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (end_page < e->start_page)
 			break;
 		else
@@ -780,6 +829,7 @@ static int handle_on_demand_page_fault(void *addr)
 				VirtualProtect(GET_PAGE_ADDRESS(range_start), (range_end - range_start + 1) * PAGE_SIZE, prot_linux2win(e->prot), &oldProtect);
 			}
 		}
+	}
 	/* TODO: Mark unmapped pages as PAGE_NOACCESS */
 	if (!found)
 		log_error("Block 0x%p not mapped.\n", GET_BLOCK(addr));
@@ -796,36 +846,38 @@ int mm_handle_page_fault(void *addr)
 		log_warning("Address %p outside of valid usermode address space.\n", addr);
 		return 0;
 	}
+	AcquireSRWLockExclusive(&mm->rw_lock);
+	int r;
 	if (get_section_handle(GET_BLOCK(addr)))
-		return handle_cow_page_fault(addr);
+		r = handle_cow_page_fault(addr);
 	else
-		return handle_on_demand_page_fault(addr);
+		r = handle_on_demand_page_fault(addr);
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+	return r;
 }
 
 int mm_fork(HANDLE process)
 {
+	AcquireSRWLockShared(&mm->rw_lock);
 	/* Copy mm_data struct */
-	if (!VirtualAllocEx(process, MM_DATA_BASE, sizeof(struct mm_data), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
-	{
-		log_error("mm_fork(): Allocate mm_data structure failed, error code: %d\n", GetLastError());
-		return 0;
-	}
-	if (!WriteProcessMemory(process, MM_DATA_BASE, mm, sizeof(struct mm_data), NULL))
+	if (!WriteProcessMemory(process, mm, mm, sizeof(struct mm_data), NULL))
 	{
 		log_error("mm_fork(): Write mm_data structure failed, error code: %d\n", GetLastError());
 		return 0;
 	}
 	/* Copy section handle tables */
+	HANDLE *forked_section_handle = VirtualAllocEx(process, NULL, BLOCK_COUNT * sizeof(HANDLE), MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE);
+	WriteProcessMemory(process, &mm_section_handle, &forked_section_handle, sizeof(HANDLE *), NULL);
 	for (size_t i = 0; i < SECTION_TABLE_COUNT; i++)
 		if (mm->section_table_handle_count[i])
 		{
-			size_t offset = i * BLOCK_SIZE;
-			if (!VirtualAllocEx(process, MM_SECTION_HANDLE_BASE + offset, BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+			size_t j = i * SECTION_HANDLE_PER_TABLE;
+			if (!VirtualAllocEx(process, &forked_section_handle[j], BLOCK_SIZE, MEM_COMMIT, PAGE_READWRITE))
 			{
 				log_error("mm_fork(): Allocate section table 0x%p failed, error code: %d\n", i, GetLastError());
 				return 0;
 			}
-			if (!WriteProcessMemory(process, MM_SECTION_HANDLE_BASE + offset, MM_SECTION_HANDLE_BASE + offset, BLOCK_SIZE, NULL))
+			if (!WriteProcessMemory(process, &forked_section_handle[j], &mm_section_handle[j], BLOCK_SIZE, NULL))
 			{
 				log_error("mm_fork(): Write section table 0x%p failed, error code: %d\n", i, GetLastError());
 				return 0;
@@ -833,15 +885,35 @@ int mm_fork(HANDLE process)
 		}
 	size_t last_block = 0;
 	size_t section_object_count = 0;
-	struct map_entry *p, *e;
 	log_info("Mapping and changing memory protection...\n");
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = rb_first(&mm->entry_tree); cur; cur = rb_next(cur))
 	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		/* Map section */
 		size_t start_block = GET_BLOCK_OF_PAGE(e->start_page);
 		size_t end_block = GET_BLOCK_OF_PAGE(e->end_page);
 		if (start_block == last_block)
 			start_block++;
+		if (e->flags & INTERNAL_MAP_COPYONFORK)
+		{
+			/* Copy on fork memory region */
+			if (!VirtualAllocEx(process, GET_BLOCK_ADDRESS(start_block), (end_block - start_block + 1) * BLOCK_SIZE, MEM_RESERVE | MEM_COMMIT, prot_linux2win(e->prot)))
+			{
+				log_error("VirtualAllocEx() failed, error code: %d\n", GetLastError());
+				mm_dump_windows_memory_mappings(process);
+				return 0;
+			}
+			/* Copy memory content to child process */
+			SIZE_T written;
+			if (!WriteProcessMemory(process, GET_BLOCK_ADDRESS(start_block), GET_BLOCK_ADDRESS(start_block),
+				(end_block - start_block + 1) * BLOCK_SIZE, &written))
+			{
+				log_error("WriteProcessMemory() failed, error code: %d\n", GetLastError());
+				mm_dump_windows_memory_mappings(process);
+				return 0;
+			}
+			continue;
+		}
 		for (size_t i = start_block; i <= end_block; i++)
 		{
 			HANDLE handle = get_section_handle(i);
@@ -861,12 +933,17 @@ int mm_fork(HANDLE process)
 			}
 		}
 		last_block = end_block;
-		/* Disable write permission */
-		if ((e->prot & PROT_WRITE) > 0)
+		/* Disable write permission on current process */
+		if (!(e->flags & INTERNAL_MAP_SHARED) && (e->prot & PROT_WRITE) > 0)
 		{
 			if (!mm_change_protection(process, e->start_page, e->end_page, e->prot & ~PROT_WRITE))
 				return 0;
 			if (!mm_change_protection(GetCurrentProcess(), e->start_page, e->end_page, e->prot & ~PROT_WRITE))
+				return 0;
+		}
+		else
+		{
+			if (!mm_change_protection(process, e->start_page, e->end_page, e->prot))
 				return 0;
 		}
 	}
@@ -874,51 +951,100 @@ int mm_fork(HANDLE process)
 	return 1;
 }
 
-void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags, struct file *f, off_t offset_pages)
+void mm_afterfork_parent()
+{
+	ReleaseSRWLockShared(&mm->rw_lock);
+}
+
+void mm_afterfork_child()
+{
+	InitializeSRWLock(&mm->rw_lock);
+	mm->static_alloc_begin = (uint8_t *)mm->static_alloc_end - MM_STATIC_ALLOC_SIZE;
+	/* Remap global shared area */
+	/* TODO: Move this to mm_fork(), since parent may already be terminated at this point */
+	map_global_shared_section();
+}
+
+static void *mmap_internal(void *addr, size_t length, int prot, int flags, int internal_flags, struct file *f, off_t offset_pages)
 {
 	if (length == 0)
-		return -EINVAL;
+		return (void*)-EINVAL;
 	length = ALIGN_TO_PAGE(length);
 	if ((size_t)addr < ADDRESS_SPACE_LOW || (size_t)addr >= ADDRESS_SPACE_HIGH
 		|| (size_t)addr + length < ADDRESS_SPACE_LOW || (size_t)addr + length >= ADDRESS_SPACE_HIGH
 		|| (size_t)addr + length < (size_t)addr)
-		return -EINVAL;
-	if (flags & MAP_SHARED)
-	{
-		log_error("MAP_SHARED is not supported yet.\n");
-		if (prot & PROT_WRITE)
-			return -EINVAL;
-		log_info("No write permission requested, ignoring MAP_SHARED.\n");
-	}
+		return (void*)-EINVAL;
 	if ((flags & MAP_ANONYMOUS) && f != NULL)
 	{
 		log_error("MAP_ANONYMOUS with file descriptor.\n");
-		return -EINVAL;
+		return (void*)-EINVAL;
 	}
 	if (!(flags & MAP_ANONYMOUS) && f == NULL)
 	{
 		log_error("MAP_FILE with bad file descriptor.\n");
-		return -EBADF;
+		return (void*)-EBADF;
 	}
-	if (!(flags & MAP_FIXED))
+	if ((internal_flags & INTERNAL_MAP_COPYONFORK) &&
+		(!IS_ALIGNED(addr, BLOCK_SIZE) || !IS_ALIGNED(length, BLOCK_SIZE)))
 	{
+		log_error("INTERNAL_MAP_COPYONFORK memory regions must be aligned on entire blocks.\n");
+		return (void*)-EINVAL;
+	}
+	if ((flags & MAP_FIXED))
+	{
+		if ((flags & MAP_SHARED) && !IS_ALIGNED(addr, BLOCK_SIZE))
+		{
+			log_error("MAP_SHARED with non-64kB aligned MAP_FIXED address is unsupported.\n");
+			return (void*)-ENOMEM;
+		}
+		if (!IS_ALIGNED(addr, PAGE_SIZE))
+		{
+			log_warning("Not page-aligned addr with MAP_FIXED.\n");
+			return (void*)-EINVAL;
+		}
+		if (!IS_ALIGNED(addr, BLOCK_SIZE))
+		{
+			/* For block unaligned fixed allocation, ensure it does not collide with MAP_SHARED memory regions */
+			/* Get the previous node whose start_page should be less than or equal to current page minus one */
+			struct rb_node *prev_node = start_node(GET_PAGE(addr) - 1);
+			if (prev_node) /* If previous node exists... */
+			{
+				struct map_entry *prev_entry = rb_entry(prev_node, struct map_entry, tree);
+				if ((prev_entry->flags & INTERNAL_MAP_SHARED)
+					&& GET_BLOCK_OF_PAGE(prev_entry->end_page) == GET_BLOCK(addr))
+				{
+					log_error("MAP_FIXED addr collides with an existing MAP_SHARED memory region.\n");
+					return (void*)-ENOMEM;
+				}
+			}
+		}
+	}
+	else /* MAP_FIXED */
+	{
+		bool block_align = false;
+		if ((flags & MAP_SHARED) || (internal_flags & INTERNAL_MAP_COPYONFORK))
+		{
+			/* MAP_SHARED blocks cannot be shared with any other memory regions */
+			/* Copy on fork memory regions are allocated via VirtualAlloc() thus must occupy entire blocks */
+			block_align = true;
+		}
 		size_t alloc_page;
-		if (internal_flags & INTERNAL_MAP_HEAP)
-			alloc_page = find_free_pages(GET_PAGE(ALIGN_TO_PAGE(length)), ADDRESS_HEAP_LOW, ADDRESS_HEAP_HIGH);
+		if (internal_flags & INTERNAL_MAP_TOPDOWN)
+			alloc_page = find_free_pages_topdown(GET_PAGE(ALIGN_TO_PAGE(length)), block_align);
 		else
-			alloc_page = find_free_pages(GET_PAGE(ALIGN_TO_PAGE(length)), ADDRESS_ALLOCATION_LOW, ADDRESS_ALLOCATION_HIGH);
+			alloc_page = find_free_pages(GET_PAGE(ALIGN_TO_PAGE(length)), block_align);
 		if (!alloc_page)
 		{
 			log_error("Cannot find free pages.\n");
-			return -ENOMEM;
+			return (void*)-ENOMEM;
 		}
 
 		addr = GET_PAGE_ADDRESS(alloc_page);
 	}
-	if ((flags & MAP_FIXED) && !IS_ALIGNED(addr, PAGE_SIZE))
+	if ((flags & MAP_SHARED))
 	{
-		log_warning("Not aligned addr with MAP_FIXED.\n");
-		return -EINVAL;
+		/* Allocate memory for now */
+		flags |= MAP_POPULATE;
 	}
 
 	size_t start_page = GET_PAGE(addr);
@@ -937,15 +1063,20 @@ void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags
 			/* The caller does not want to overwrite existing pages
 			 * Check whether it is possible before doing anything
 			 */
-			struct map_entry *p, *e;
-			forward_list_iterate(&mm->map_list, p, e)
+			for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+			{
+				struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 				if (end_page < e->start_page)
 					break;
 				else if (start_page <= e->end_page && e->start_page <= end_page)
-					return -ENOMEM;
+					return (void*)-ENOMEM;
+			}
 		}
 		else
-			mm_munmap(addr, length);
+		{
+			static int munmap_internal(void *addr, size_t length);
+			munmap_internal(addr, length);
+		}
 	}
 
 	/* Set up all kinds of flags */
@@ -957,25 +1088,23 @@ void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags
 	entry->prot = prot;
 	if (f)
 		vfs_ref(f);
+	entry->flags = 0;
+	if (internal_flags & INTERNAL_MAP_NORESET)
+		entry->flags |= INTERNAL_MAP_NORESET;
+	if (internal_flags & INTERNAL_MAP_COPYONFORK)
+		entry->flags |= INTERNAL_MAP_COPYONFORK;
 
-	if (forward_list_empty(&mm->map_list))
-		forward_list_add(&mm->map_list, entry);
-	else
+	rb_add(&mm->entry_tree, &entry->tree, map_entry_cmp);
+
+	if (internal_flags & INTERNAL_MAP_COPYONFORK)
 	{
-		struct map_entry *p, *e;
-		/* No need to use forward_list_safe since we will break immediately after node insertion */
-		forward_list_iterate(&mm->map_list, p, e)
+		/* Allocate the memory now */
+		if (!VirtualAlloc(GET_PAGE_ADDRESS(start_page), (end_page - start_page + 1) * PAGE_SIZE, MEM_RESERVE | MEM_COMMIT, prot_linux2win(prot)))
 		{
-			if (e->start_page > end_page)
-			{
-				forward_list_add(p, entry);
-				break;
-			}
-			else if (forward_list_next(e) == NULL)
-			{
-				forward_list_add(e, entry);
-				break;
-			}
+			log_error("VirtualAlloc(%p, %p) failed, error code: %d\n", GET_PAGE_ADDRESS(start_page),
+				(end_page - start_page + 1) * PAGE_SIZE, GetLastError());
+			mm_dump_windows_memory_mappings(GetCurrentProcess());
+			return (void*)-ENOMEM;
 		}
 	}
 
@@ -986,7 +1115,7 @@ void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags
 		if (!take_block_ownership(start_block))
 		{
 			log_error("Taking ownership of block %p failed.\n", start_block);
-			return -ENOMEM;
+			return (void*)-ENOMEM;
 		}
 		size_t last_page = GET_LAST_PAGE_OF_BLOCK(start_block);
 		last_page = min(last_page, end_page);
@@ -995,13 +1124,14 @@ void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags
 		map_entry_range(entry, start_page, last_page);
 		if ((prot & PROT_WRITE) == 0)
 			VirtualProtect(GET_PAGE_ADDRESS(start_page), (last_page - start_page + 1) * PAGE_SIZE, prot_linux2win(prot), &oldProtect);
+		start_block++;
 	}
-	if (end_block > start_block && get_section_handle(end_block))
+	if (end_block >= start_block && get_section_handle(end_block))
 	{
 		if (!take_block_ownership(end_block))
 		{
 			log_error("Taking ownership of block %p failed.\n", start_block);
-			return -ENOMEM;
+			return (void*)-ENOMEM;
 		}
 		size_t first_page = GET_FIRST_PAGE_OF_BLOCK(end_block);
 		DWORD oldProtect;
@@ -1009,12 +1139,20 @@ void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags
 		map_entry_range(entry, first_page, end_page);
 		if ((prot & PROT_WRITE) == 0)
 			VirtualProtect(GET_PAGE_ADDRESS(first_page), (end_page - first_page + 1) * PAGE_SIZE, prot_linux2win(prot), &oldProtect);
+		end_block--;
+	}
+	if ((flags & MAP_POPULATE) && start_block < end_block)
+	{
+		for (size_t i = start_block; i <= end_block; i++)
+			allocate_block(i);
+		map_entry_range(entry, GET_FIRST_PAGE_OF_BLOCK(start_block), GET_LAST_PAGE_OF_BLOCK(end_block));
+		mm_change_protection(GetCurrentProcess(), GET_FIRST_PAGE_OF_BLOCK(start_block), GET_LAST_PAGE_OF_BLOCK(end_block), prot);
 	}
 	log_info("Allocated memory: [%p, %p)\n", addr, (size_t)addr + length);
 	return addr;
 }
 
-int mm_munmap(void *addr, size_t length)
+static int munmap_internal(void *addr, size_t length)
 {
 	/* TODO: We should mark NOACCESS for munmap()-ed but not VirtualFree()-ed pages */
 	if (!IS_ALIGNED(addr, PAGE_SIZE))
@@ -1029,8 +1167,9 @@ int mm_munmap(void *addr, size_t length)
 
 	size_t start_page = GET_PAGE(addr);
 	size_t end_page = GET_PAGE((size_t)addr + length - 1);
-	struct map_entry *p, *e;
-	forward_list_iterate_safe(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur;)
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (end_page < e->start_page)
 			break;
 		else
@@ -1038,13 +1177,23 @@ int mm_munmap(void *addr, size_t length)
 			size_t range_start = max(start_page, e->start_page);
 			size_t range_end = min(end_page, e->end_page);
 			if (range_start > range_end)
+			{
+				cur = rb_next(cur);
 				continue;
+			}
 			if (range_start == e->start_page && range_end == e->end_page)
 			{
 				/* That's good, the current entry is fully overlapped */
-				free_map_entry_blocks(p, e);
-				forward_list_remove(p, e);
+				if (e->prot & PROT_EXEC)
+				{
+					/* Notify dbt subsystem the executable pages has been lost */
+					dbt_code_changed((size_t)GET_PAGE_ADDRESS(e->start_page), (e->end_page - e->start_page + 1) * PAGE_SIZE);
+				}
+				struct rb_node *next = rb_next(cur);
+				free_map_entry_blocks(e);
+				rb_remove(&mm->entry_tree, cur);
 				free_map_entry(e);
+				cur = next;
 			}
 			else
 			{
@@ -1052,18 +1201,38 @@ int mm_munmap(void *addr, size_t length)
 				if (range_start == e->start_page)
 				{
 					split_map_entry(e, range_end);
-					free_map_entry_blocks(p, e);
-					forward_list_remove(p, e);
+					struct rb_node *next = rb_next(cur);
+					free_map_entry_blocks(e);
+					rb_remove(&mm->entry_tree, cur);
 					free_map_entry(e);
+					cur = next;
 				}
 				else
 				{
 					split_map_entry(e, range_start - 1);
 					/* The current entry is unrelated, we just skip to next entry (which we just generated) */
+					cur = rb_next(cur);
 				}
 			}
 		}
+	}
 	return 0;
+}
+
+void *mm_mmap(void *addr, size_t length, int prot, int flags, int internal_flags, struct file *f, off_t offset_pages)
+{
+	AcquireSRWLockExclusive(&mm->rw_lock);
+	void *r = mmap_internal(addr, length, prot, flags, internal_flags, f, offset_pages);
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+	return r;
+}
+
+int mm_munmap(void *addr, size_t length)
+{
+	AcquireSRWLockExclusive(&mm->rw_lock);
+	int r = munmap_internal(addr, length);
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(mmap, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset)
@@ -1073,7 +1242,11 @@ DEFINE_SYSCALL(mmap, void *, addr, size_t, length, int, prot, int, flags, int, f
 	/* TODO: Initialize mapped area to zero */
 	if (!IS_ALIGNED(offset, PAGE_SIZE))
 		return -EINVAL;
-	return mm_mmap(addr, length, prot, flags, 0, vfs_get(fd), offset / PAGE_SIZE);
+	struct file *f = vfs_get(fd);
+	intptr_t r = (intptr_t)mm_mmap(addr, length, prot, flags, 0, f, offset / PAGE_SIZE);
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(oldmmap, void *, _args)
@@ -1095,7 +1268,11 @@ DEFINE_SYSCALL(oldmmap, void *, _args)
 DEFINE_SYSCALL(mmap2, void *, addr, size_t, length, int, prot, int, flags, int, fd, off_t, offset)
 {
 	log_info("mmap2(%p, %p, %x, %x, %d, %p)\n", addr, length, prot, flags, fd, offset);
-	return mm_mmap(addr, length, prot, flags, 0, vfs_get(fd), offset);
+	struct file *f = vfs_get(fd);
+	intptr_t r = (intptr_t)mm_mmap(addr, length, prot, flags, 0, f, offset);
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(munmap, void *, addr, size_t, length)
@@ -1107,21 +1284,28 @@ DEFINE_SYSCALL(munmap, void *, addr, size_t, length)
 DEFINE_SYSCALL(mprotect, void *, addr, size_t, length, int, prot)
 {
 	log_info("mprotect(%p, %p, %x)\n", addr, length, prot);
+	int r = 0;
+	AcquireSRWLockExclusive(&mm->rw_lock);
 	if (!IS_ALIGNED(addr, PAGE_SIZE))
-		return -EINVAL;
+	{
+		r = -EINVAL;
+		goto out;
+	}
 	length = ALIGN_TO_PAGE(length);
 	if ((size_t)addr < ADDRESS_SPACE_LOW || (size_t)addr >= ADDRESS_SPACE_HIGH
 		|| (size_t)addr + length < ADDRESS_SPACE_LOW || (size_t)addr + length >= ADDRESS_SPACE_HIGH
 		|| (size_t)addr + length < (size_t)addr)
 	{
-		return -EINVAL;
+		r = -EINVAL;
+		goto out;
 	}
 	/* Validate all pages are mapped */
 	size_t start_page = GET_PAGE(addr);
 	size_t end_page = GET_PAGE((size_t)addr + length - 1);
 	size_t last_page = start_page - 1;
-	struct map_entry *p, *e;
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (e->start_page > end_page)
 			break;
 		else if (e->end_page >= start_page)
@@ -1131,11 +1315,17 @@ DEFINE_SYSCALL(mprotect, void *, addr, size_t, length, int, prot)
 			else
 				break;
 		}
+	}
 	if (last_page < end_page)
-		return -ENOMEM;
-	;
+	{
+		r = -ENOMEM;
+		goto out;
+	}
+
 	/* Change protection flags */
-	forward_list_iterate_safe(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (end_page < e->start_page)
 			break;
 		else
@@ -1164,10 +1354,17 @@ DEFINE_SYSCALL(mprotect, void *, addr, size_t, length, int, prot)
 				}
 			}
 		}
+	}
 	if (!mm_change_protection(GetCurrentProcess(), start_page, end_page, prot & ~PROT_WRITE))
+	{
 		/* We remove the write protection in case the pages are already shared */
-		return -ENOMEM; /* TODO */
-	return 0;
+		r = -ENOMEM; /* TODO */
+		goto out;
+	}
+
+out:
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(msync, void *, addr, size_t, len, int, flags)
@@ -1177,17 +1374,13 @@ DEFINE_SYSCALL(msync, void *, addr, size_t, len, int, flags)
 	return -ENOSYS;
 }
 
-DEFINE_SYSCALL(mlock, const void *, addr, size_t, len)
+static int mm_populate_internal(const void *addr, size_t len)
 {
-	log_info("mlock(0x%p, 0x%p)\n", addr, len);
-	if (!IS_ALIGNED(addr, PAGE_SIZE))
-		return -EINVAL;
-
-	/* All on demand page must be properly loaded or the locking operation will fail */
 	size_t start_page = GET_PAGE(addr);
 	size_t end_page = GET_PAGE((size_t)addr + len);
-	struct map_entry *p, *e;
-	forward_list_iterate(&mm->map_list, p, e)
+	for (struct rb_node *cur = start_node(start_page); cur; cur = rb_next(cur))
+	{
+		struct map_entry *e = rb_entry(cur, struct map_entry, tree);
 		if (e->start_page > end_page)
 			break;
 		else
@@ -1217,16 +1410,50 @@ DEFINE_SYSCALL(mlock, const void *, addr, size_t, len)
 					}
 				}
 		}
+	}
 	/* TODO: Mark unused pages as NOACCESS */
+	return 0;
+}
+
+void mm_populate(void *addr)
+{
+	AcquireSRWLockExclusive(&mm->rw_lock);
+	size_t page = GET_PAGE(addr);
+	struct rb_node *cur = start_node(page);
+	struct map_entry *e = rb_entry(cur, struct map_entry, tree);
+	if (e->start_page <= page && page <= e->end_page)
+		mm_populate_internal(GET_PAGE_ADDRESS(e->start_page), (e->end_page - e->start_page + 1) * PAGE_SIZE);
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+}
+
+DEFINE_SYSCALL(mlock, const void *, addr, size_t, len)
+{
+	log_info("mlock(0x%p, 0x%p)\n", addr, len);
+	int r = 0;
+	AcquireSRWLockExclusive(&mm->rw_lock);
+	if (!IS_ALIGNED(addr, PAGE_SIZE))
+	{
+		r = -EINVAL;
+		goto out;
+	}
+
+	/* All on demand page must be properly loaded or the locking operation will fail */
+	r = mm_populate_internal(addr, len);
+	if (!r)
+		goto out;
 
 	/* The actual locking */
 	/* TODO: Automatically enlarge working set size for arbitrary sized mlock() call */
-	if (!VirtualLock(addr, len))
+	if (!VirtualLock((LPVOID)addr, len))
 	{
 		log_warning("VirtualLock() failed, error code: %d\n", GetLastError());
-		return -ENOMEM;
+		r = -ENOMEM;
+		goto out;
 	}
-	return 0;
+	ReleaseSRWLockExclusive(&mm->rw_lock);
+
+out:
+	return r;
 }
 
 DEFINE_SYSCALL(munlock, const void *, addr, size_t, len)
@@ -1234,7 +1461,7 @@ DEFINE_SYSCALL(munlock, const void *, addr, size_t, len)
 	log_info("munlock(0x%p, 0x%p)\n", addr, len);
 	if (!IS_ALIGNED(addr, PAGE_SIZE))
 		return -EINVAL;
-	if (!VirtualUnlock(addr, len))
+	if (!VirtualUnlock((LPVOID)addr, len))
 	{
 		log_warning("VirtualUnlock() failed, error code: %d\n", GetLastError());
 		return -ENOMEM;
@@ -1262,11 +1489,12 @@ DEFINE_SYSCALL(brk, void *, addr)
 {
 	log_info("brk(%p)\n", addr);
 	log_info("Last brk: %p\n", mm->brk);
+	AcquireSRWLockExclusive(&mm->rw_lock);
 	size_t brk = ALIGN_TO_PAGE(mm->brk);
-	addr = ALIGN_TO_PAGE(addr);
+	addr = (void*)ALIGN_TO_PAGE(addr);
 	if (addr > 0 && addr < mm->brk)
 	{
-		if (mm_munmap(addr, (size_t)brk - (size_t)addr) < 0)
+		if (munmap_internal(addr, (size_t)brk - (size_t)addr) < 0)
 		{
 			log_error("Shrink brk failed.\n");
 			goto out;
@@ -1275,7 +1503,7 @@ DEFINE_SYSCALL(brk, void *, addr)
 	}
 	else if (addr > mm->brk)
 	{
-		int r = (int)mm_mmap(brk, (size_t)addr - (size_t)brk, PROT_READ | PROT_WRITE | PROT_EXEC,
+		int r = (int)mmap_internal((void *)brk, (size_t)addr - (size_t)brk, PROT_READ | PROT_WRITE | PROT_EXEC,
 			MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, INTERNAL_MAP_NOOVERWRITE, NULL, 0);
 		if (r < 0)
 		{
@@ -1285,6 +1513,7 @@ DEFINE_SYSCALL(brk, void *, addr)
 		mm->brk = addr;
 	}
 out:
+	ReleaseSRWLockExclusive(&mm->rw_lock);
 	log_info("New brk: %p\n", mm->brk);
-	return mm->brk;
+	return (intptr_t)mm->brk;
 }

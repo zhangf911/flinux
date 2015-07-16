@@ -45,7 +45,7 @@ struct winfs_file
 	char pathname[]; /* Not necessary null-terminated */
 };
 
-/* Convert an utf-8 file name to NT file name, return converted name length in bytes, no NULL terminator is appended */
+/* Convert an utf-8 file name to NT file name, return converted name length in characters, no NULL terminator is appended */
 static int filename_to_nt_pathname(const char *filename, WCHAR *buf, int buf_size)
 {
 	if (buf_size < 4)
@@ -240,15 +240,19 @@ static int winfs_close(struct file *f)
 
 static int winfs_getpath(struct file *f, char *buf)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *)f;
 	buf[0] = '/'; /* the mountpoint */
 	memcpy(buf + 1, winfile->pathname, winfile->pathlen);
 	buf[1 + winfile->pathlen] = 0;
-	return winfile->pathlen + 1;
+	int r = winfile->pathlen + 1;
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
-static size_t winfs_read(struct file *f, char *buf, size_t count)
+static size_t winfs_read(struct file *f, void *buf, size_t count)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	size_t num_read = 0;
 	while (count > 0)
@@ -258,20 +262,23 @@ static size_t winfs_read(struct file *f, char *buf, size_t count)
 		if (!ReadFile(winfile->handle, buf, count_dword, &num_read_dword, NULL))
 		{
 			if (GetLastError() == ERROR_HANDLE_EOF)
-				return num_read;
+				break;
 			log_warning("ReadFile() failed, error code: %d\n", GetLastError());
-			return -EIO;
+			num_read = -EIO;
+			break;
 		}
 		if (num_read_dword == 0)
-			return num_read;
+			break;
 		num_read += num_read_dword;
 		count -= num_read_dword;
 	}
+	ReleaseSRWLockShared(&f->rw_lock);
 	return num_read;
 }
 
-static size_t winfs_write(struct file *f, const char *buf, size_t count)
+static size_t winfs_write(struct file *f, const void *buf, size_t count)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	size_t num_written = 0;
 	OVERLAPPED overlapped;
@@ -288,16 +295,19 @@ static size_t winfs_write(struct file *f, const char *buf, size_t count)
 		if (!WriteFile(winfile->handle, buf, count_dword, &num_written_dword, overlapped_pointer))
 		{
 			log_warning("WriteFile() failed, error code: %d\n", GetLastError());
-			return -EIO;
+			num_written = -EIO;
+			break;
 		}
 		num_written += num_written_dword;
 		count -= num_written_dword;
 	}
+	ReleaseSRWLockShared(&f->rw_lock);
 	return num_written;
 }
 
-static size_t winfs_pread(struct file *f, char *buf, size_t count, loff_t offset)
+static size_t winfs_pread(struct file *f, void *buf, size_t count, loff_t offset)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	size_t num_read = 0;
 	while (count > 0)
@@ -313,21 +323,24 @@ static size_t winfs_pread(struct file *f, char *buf, size_t count, loff_t offset
 		if (!ReadFile(winfile->handle, buf, count_dword, &num_read_dword, &overlapped))
 		{
 			if (GetLastError() == ERROR_HANDLE_EOF)
-				return num_read;
+				break;
 			log_warning("ReadFile() failed, error code: %d\n", GetLastError());
-			return -EIO;
+			num_read = -EIO;
+			break;
 		}
 		if (num_read_dword == 0)
-			return num_read;
+			break;
 		num_read += num_read_dword;
 		offset += num_read_dword;
 		count -= num_read_dword;
 	}
+	ReleaseSRWLockShared(&f->rw_lock);
 	return num_read;
 }
 
-static size_t winfs_pwrite(struct file *f, const char *buf, size_t count, loff_t offset)
+static size_t winfs_pwrite(struct file *f, const void *buf, size_t count, loff_t offset)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	size_t num_written = 0;
 	while (count > 0)
@@ -343,19 +356,23 @@ static size_t winfs_pwrite(struct file *f, const char *buf, size_t count, loff_t
 		if (!WriteFile(winfile->handle, buf, count_dword, &num_written_dword, &overlapped))
 		{
 			log_warning("WriteFile() failed, error code: %d\n", GetLastError());
-			return -EIO;
+			num_written = -EIO;
+			break;
 		}
 		num_written += num_written_dword;
 		offset += num_written_dword;
 		count -= num_written_dword;
 	}
+	ReleaseSRWLockShared(&f->rw_lock);
 	return num_written;
 }
 
 static size_t winfs_readlink(struct file *f, char *target, size_t buflen)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	int r = winfs_read_symlink(winfile->handle, target, (int)buflen);
+	ReleaseSRWLockShared(&f->rw_lock);
 	if (r == 0)
 		return -EINVAL;
 	return r;
@@ -363,6 +380,7 @@ static size_t winfs_readlink(struct file *f, char *target, size_t buflen)
 
 static int winfs_truncate(struct file *f, loff_t length)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	/* TODO: Correct errno */
 	FILE_END_OF_FILE_INFORMATION info;
@@ -370,6 +388,7 @@ static int winfs_truncate(struct file *f, loff_t length)
 	IO_STATUS_BLOCK status_block;
 	NTSTATUS status;
 	status = NtSetInformationFile(winfile->handle, &status_block, &info, sizeof(info), FileEndOfFileInformation);
+	ReleaseSRWLockShared(&f->rw_lock);
 	if (!NT_SUCCESS(status))
 	{
 		log_warning("NtSetInformationFile(FileEndOfFileInformation) failed, status: %x\n", status);
@@ -380,8 +399,11 @@ static int winfs_truncate(struct file *f, loff_t length)
 
 static int winfs_fsync(struct file *f)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
-	if (!FlushFileBuffers(winfile->handle))
+	BOOL ok = FlushFileBuffers(winfile->handle);
+	ReleaseSRWLockShared(&f->rw_lock);
+	if (!ok)
 	{
 		log_warning("FlushFileBuffers() failed, error code: %d\n", GetLastError());
 		return -EIO;
@@ -401,6 +423,7 @@ static int winfs_llseek(struct file *f, loff_t offset, loff_t *newoffset, int wh
 		dwMoveMethod = FILE_END;
 	else
 		return -EINVAL;
+	AcquireSRWLockExclusive(&f->rw_lock);
 	LARGE_INTEGER liDistanceToMove, liNewFilePointer;
 	liDistanceToMove.QuadPart = offset;
 	SetFilePointerEx(winfile->handle, liDistanceToMove, &liNewFilePointer, dwMoveMethod);
@@ -410,18 +433,17 @@ static int winfs_llseek(struct file *f, loff_t offset, loff_t *newoffset, int wh
 		/* TODO: Currently we don't know if it is a directory, pretend it is */
 		winfile->restart_scan = 1;
 	}
+	ReleaseSRWLockExclusive(&f->rw_lock);
 	return 0;
 }
 
 static int winfs_stat(struct file *f, struct newstat *buf)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	BY_HANDLE_FILE_INFORMATION info;
-	if (!GetFileInformationByHandle(winfile->handle, &info))
-	{
-		log_warning("GetFileInformationByHandle() failed.\n");
-		return -1; /* TODO */
-	}
+	GetFileInformationByHandle(winfile->handle, &info);
+
 	/* Programs (ld.so) may use st_dev and st_ino to identity files so these must be unique for each file. */
 	INIT_STRUCT_NEWSTAT_PADDING(buf);
 	buf->st_dev = mkdev(8, 0); // (8, 0): /dev/sda
@@ -466,11 +488,13 @@ static int winfs_stat(struct file *f, struct newstat *buf)
 	buf->st_mtime_nsec = filetime_to_unix_nsec(&info.ftLastWriteTime);
 	buf->st_ctime = filetime_to_unix_sec(&info.ftCreationTime);
 	buf->st_ctime_nsec = filetime_to_unix_nsec(&info.ftCreationTime);
+	ReleaseSRWLockShared(&f->rw_lock);
 	return 0;
 }
 
 static int winfs_utimens(struct file *f, const struct timespec *times)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfs = (struct winfs_file *)f;
 	if (!times)
 	{
@@ -487,11 +511,13 @@ static int winfs_utimens(struct file *f, const struct timespec *times)
 		unix_timespec_to_filetime(&times[1], &modtime);
 		SetFileTime(winfs->handle, NULL, &actime, &modtime);
 	}
+	ReleaseSRWLockShared(&f->rw_lock);
 	return 0;
 }
 
 static int winfs_getdents(struct file *f, void *dirent, size_t count, getdents_callback *fill_callback)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	NTSTATUS status;
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	IO_STATUS_BLOCK status_block;
@@ -501,7 +527,10 @@ static int winfs_getdents(struct file *f, void *dirent, size_t count, getdents_c
 
 	for (;;)
 	{
-		int buffer_size = (count - size) / 2; /* In worst case, a UTF-16 character (2 bytes) requires 4 bytes to store */
+		/* sizeof(FILE_ID_FULL_DIR_INFORMATION) is larger than both sizeof(struct dirent) and sizeof(struct dirent64)
+		 * So we don't need to worry about header size.
+		 * For the file name, in worst case, a UTF-16 character (2 bytes) requires 4 bytes to store */
+		int buffer_size = (count - size) / 2;
 		if (buffer_size >= BUFFER_SIZE)
 			buffer_size = BUFFER_SIZE;
 		status = NtQueryDirectoryFile(winfile->handle, NULL, NULL, NULL, &status_block, buffer, buffer_size, FileIdFullDirectoryInformation, FALSE, NULL, winfile->restart_scan);
@@ -559,26 +588,34 @@ static int winfs_getdents(struct file *f, void *dirent, size_t count, getdents_c
 				else
 					log_warning("NtCreateFile() failed, status: %x\n", status);
 			}
-			intptr_t reclen = fill_callback(p, inode, info->FileName, info->FileNameLength / 2, type, count - size);
+			intptr_t reclen = fill_callback(p, inode, info->FileName, info->FileNameLength / 2, type, count - size, GETDENTS_UTF16);
 			if (reclen < 0)
-				return reclen;
+			{
+				size = reclen;
+				goto out;
+			}
 			size += reclen;
 		} while (info->NextEntryOffset);
 	}
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
 	return size;
 	#undef BUFFER_SIZE
 }
 
 static int winfs_statfs(struct file *f, struct statfs64 *buf)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	FILE_FS_FULL_SIZE_INFORMATION info;
 	IO_STATUS_BLOCK status_block;
 	NTSTATUS status = NtQueryVolumeInformationFile(winfile->handle, &status_block, &info, sizeof(info), FileFsFullSizeInformation);
+	int r = 0;
 	if (!NT_SUCCESS(status))
 	{
 		log_warning("NtQueryVolumeInformationFile() failed, status: %x\n", status);
-		return -EIO;
+		r = -EIO;
+		goto out;
 	}
 	buf->f_type = 0x5346544e; /* NTFS_SB_MAGIC */
 	buf->f_bsize = info.SectorsPerAllocationUnit * info.BytesPerSector;
@@ -596,7 +633,9 @@ static int winfs_statfs(struct file *f, struct statfs64 *buf)
 	buf->f_spare[1] = 0;
 	buf->f_spare[2] = 0;
 	buf->f_spare[3] = 0;
-	return 0;
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
 static struct file_ops winfs_ops = 
@@ -617,7 +656,7 @@ static struct file_ops winfs_ops =
 	.statfs = winfs_statfs,
 };
 
-static int winfs_symlink(const char *target, const char *linkpath)
+static int winfs_symlink(struct file_system *fs, const char *target, const char *linkpath)
 {
 	HANDLE handle;
 	WCHAR wlinkpath[PATH_MAX];
@@ -656,28 +695,36 @@ static int winfs_symlink(const char *target, const char *linkpath)
 	return 0;
 }
 
-static int winfs_link(struct file *f, const char *newpath)
+static int winfs_link(struct file_system *fs, struct file *f, const char *newpath)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *) f;
 	NTSTATUS status;
+	int r = 0;
 	char buf[sizeof(FILE_LINK_INFORMATION) + PATH_MAX * 2];
 	FILE_LINK_INFORMATION *info = (FILE_LINK_INFORMATION *)buf;
 	info->ReplaceIfExists = FALSE;
 	info->RootDirectory = NULL;
 	info->FileNameLength = 2 * filename_to_nt_pathname(newpath, info->FileName, PATH_MAX);
 	if (info->FileNameLength == 0)
-		return -ENOENT;
+	{
+		r = -ENOENT;
+		goto out;
+	}
 	IO_STATUS_BLOCK status_block;
 	status = NtSetInformationFile(winfile->handle, &status_block, info, info->FileNameLength + sizeof(FILE_LINK_INFORMATION), FileLinkInformation);
 	if (!NT_SUCCESS(status))
 	{
 		log_warning("NtSetInformationFile() failed, status: %x.\n", status);
-		return -ENOENT;
+		r = -ENOENT;
+		goto out;
 	}
-	return 0;
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
-static int winfs_unlink(const char *pathname)
+static int winfs_unlink(struct file_system *fs, const char *pathname)
 {
 	WCHAR wpathname[PATH_MAX];
 	int len = filename_to_nt_pathname(pathname, wpathname, PATH_MAX);
@@ -734,28 +781,53 @@ static int winfs_unlink(const char *pathname)
 	return 0;
 }
 
-static int winfs_rename(struct file *f, const char *newpath)
+static int winfs_rename(struct file_system *fs, struct file *f, const char *newpath)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct winfs_file *winfile = (struct winfs_file *)f;
 	char buf[sizeof(FILE_RENAME_INFORMATION) + PATH_MAX * 2];
 	NTSTATUS status;
+	int r = 0;
+	int retry_count = 5;
+retry:
+	if (--retry_count == 0)
+	{
+		r = -EPERM;
+		goto out;
+	}
 	FILE_RENAME_INFORMATION *info = (FILE_RENAME_INFORMATION *)buf;
-	info->ReplaceIfExists = TRUE; /* TODO: This should be worked on to provide true Linux semantics (refer to unlink()) */
+	info->ReplaceIfExists = TRUE;
 	info->RootDirectory = NULL;
 	info->FileNameLength = 2 * filename_to_nt_pathname(newpath, info->FileName, PATH_MAX);
 	if (info->FileNameLength == 0)
-		return -ENOENT;
+	{
+		r = -ENOENT;
+		goto out;
+	}
 	IO_STATUS_BLOCK status_block;
 	status = NtSetInformationFile(winfile->handle, &status_block, info, info->FileNameLength + sizeof(FILE_RENAME_INFORMATION), FileRenameInformation);
 	if (!NT_SUCCESS(status))
 	{
+		if (status == STATUS_ACCESS_DENIED)
+		{
+			/* The destination exists and the operation cannot be completed via a native operation.
+			 * We remove the destination file first, then move this file again.
+			 */
+			r = winfs_unlink(fs, newpath);
+			if (r)
+				goto out;
+			goto retry;
+		}
 		log_warning("NtSetInformationFile() failed, status: %x\n", status);
-		return -ENOENT;
+		r = -ENOENT;
+		goto out;
 	}
-	return 0;
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
-static int winfs_mkdir(const char *pathname, int mode)
+static int winfs_mkdir(struct file_system *fs, const char *pathname, int mode)
 {
 	WCHAR wpathname[PATH_MAX];
 
@@ -775,7 +847,7 @@ static int winfs_mkdir(const char *pathname, int mode)
 	return 0;
 }
 
-static int winfs_rmdir(const char *pathname)
+static int winfs_rmdir(struct file_system *fs, const char *pathname)
 {
 	WCHAR wpathname[PATH_MAX];
 	if (utf8_to_utf16_filename(pathname, strlen(pathname) + 1, wpathname, PATH_MAX) <= 0)
@@ -788,85 +860,82 @@ static int winfs_rmdir(const char *pathname)
 	return 0;
 }
 
-static int winfs_open(const char *pathname, int flags, int mode, struct file **fp, char *target, int buflen)
+/* Open a file
+ * Return values:
+ *  < 0 => errno
+ * == 0 => Opening file succeeded
+ *  > 0 => It is a symlink which needs to be redirected (target written)
+ */
+static int open_file(HANDLE *hFile, const char *pathname, DWORD desired_access, DWORD create_disposition,
+	int flags, BOOL bInherit, char *target, int buflen)
 {
-	/* TODO: mode */
-	DWORD desiredAccess, shareMode, creationDisposition;
-	HANDLE handle;
-	FILE_ATTRIBUTE_TAG_INFO attributeInfo;
-	WCHAR wpathname[PATH_MAX];
-	struct winfs_file *file;
-	int pathlen = strlen(pathname);
-
-	if (utf8_to_utf16_filename(pathname, pathlen + 1, wpathname, PATH_MAX) <= 0)
+	WCHAR buf[PATH_MAX];
+	UNICODE_STRING name;
+	name.Buffer = buf;
+	name.MaximumLength = name.Length = 2 * filename_to_nt_pathname(pathname, buf, PATH_MAX);
+	if (name.Length == 0)
 		return -ENOENT;
-	if (wpathname[0] == 0)
-	{
-		/* CreateFile() does not accept empty filename. */
-		wpathname[0] = '.';
-		wpathname[1] = 0;
-	}
-	
-	if (flags & O_PATH)
-		desiredAccess = 0;
-	else if (flags & O_RDWR)
-		desiredAccess = GENERIC_READ | GENERIC_WRITE;
-	else if (flags & O_WRONLY)
-		desiredAccess = GENERIC_WRITE;
+
+	OBJECT_ATTRIBUTES attr;
+	attr.Length = sizeof(OBJECT_ATTRIBUTES);
+	attr.RootDirectory = NULL;
+	attr.ObjectName = &name;
+	attr.Attributes = (bInherit? OBJ_INHERIT: 0);
+	attr.SecurityDescriptor = NULL;
+	attr.SecurityQualityOfService = NULL;
+
+	NTSTATUS status;
+	IO_STATUS_BLOCK status_block;
+	HANDLE handle;
+	DWORD create_options = FILE_SYNCHRONOUS_IO_NONALERT; /* For synchronous I/O */
+	if (desired_access & GENERIC_ALL)
+		create_options |= FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REMOTE_INSTANCE;
 	else
-		desiredAccess = GENERIC_READ;
-	if (flags & __O_DELETE)
-		desiredAccess |= DELETE;
-	shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-	creationDisposition;
-	if (flags & O_EXCL)
-		creationDisposition = CREATE_NEW;
-	else if (flags & O_CREAT)
-		creationDisposition = OPEN_ALWAYS;
-	else
-		creationDisposition = OPEN_EXISTING;
-	//log_debug("CreateFileW(): %s\n", pathname);
-	SECURITY_ATTRIBUTES attr;
-	attr.nLength = sizeof(SECURITY_ATTRIBUTES);
-	attr.lpSecurityDescriptor = NULL;
-	attr.bInheritHandle = (fp != NULL);
-	handle = CreateFileW(wpathname, desiredAccess, shareMode, &attr, creationDisposition, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, NULL);
-	if (handle == INVALID_HANDLE_VALUE)
 	{
-		DWORD err = GetLastError();
-		if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)
-		{
-			log_warning("File already exists.\n");
-			return -EEXIST;
-		}
-		else
-		{
-			log_warning("Unhandled CreateFileW() failure, error code: %d, returning ENOENT.\n", GetLastError());
-			return -ENOENT;
-		}
+		if (desired_access & GENERIC_READ)
+			create_options |= FILE_OPEN_FOR_BACKUP_INTENT;
+		if (desired_access & GENERIC_WRITE)
+			create_options |= FILE_OPEN_REMOTE_INSTANCE;
 	}
-	if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &attributeInfo, sizeof(attributeInfo)))
+	desired_access |= SYNCHRONIZE | FILE_READ_ATTRIBUTES;
+	status = NtCreateFile(&handle, desired_access, &attr, &status_block, NULL,
+		FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		create_disposition, create_options, NULL, 0);
+	if (status == STATUS_OBJECT_NAME_COLLISION)
 	{
-		CloseHandle(handle);
+		log_warning("File already exists.\n");
+		return -EEXIST;
+	}
+	else if (!NT_SUCCESS(status))
+	{
+		log_warning("Unhandled NtCreateFile error, status: %x, returning ENOENT.\n", status);
+		return -ENOENT;
+	}
+
+	FILE_ATTRIBUTE_TAG_INFORMATION attribute_info;
+	status = NtQueryInformationFile(handle, &status_block, &attribute_info, sizeof(attribute_info), FileAttributeTagInformation);
+	if (!NT_SUCCESS(status))
+	{
+		log_error("NtQueryInformationFile(FileAttributeTagInformation) failed, status: %x\n", status);
+		NtClose(handle);
 		return -EIO;
 	}
 	/* Test if the file is a symlink */
 	int is_symlink = 0;
-	if (attributeInfo.FileAttributes != INVALID_FILE_ATTRIBUTES && (attributeInfo.FileAttributes & FILE_ATTRIBUTE_SYSTEM))
+	if (attribute_info.FileAttributes & FILE_ATTRIBUTE_SYSTEM)
 	{
-		log_info("The file has system flag set.\n");
-		if (!(desiredAccess & GENERIC_READ))
+		/* The file has system flag set. A potential symbolic link. */
+		if (!(desired_access & GENERIC_READ))
 		{
-			/* We need to get a readable handle */
-			log_info("But the handle does not have READ access, try reopening file...\n");
-			HANDLE read_handle = ReOpenFile(handle, desiredAccess | GENERIC_READ, shareMode, FILE_FLAG_BACKUP_SEMANTICS);
+			/* But the handle does not have READ access, try reopening file */
+			HANDLE read_handle = ReOpenFile(handle, desired_access | GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS);
 			if (read_handle == INVALID_HANDLE_VALUE)
 			{
-				log_warning("Reopen file failed, error code %d. Assume not symlink.\n", GetLastError());
-				goto after_symlink_test;
+				log_warning("Reopen symlink file failed, error code %d. Assume not symlink.\n", GetLastError());
+				return 0;
 			}
 			CloseHandle(handle);
-			log_info("Reopen succeeded.\n");
 			handle = read_handle;
 		}
 		if (winfs_read_symlink(handle, target, buflen) > 0)
@@ -882,18 +951,43 @@ static int winfs_open(const char *pathname, int flags, int mode, struct file **f
 				log_info("Specified O_NOFOLLOW but not O_PATH, returning ELOOP.\n");
 				return -ELOOP;
 			}
-			is_symlink = 1;
 		}
-		log_info("Opening file directly.\n");
 	}
-	else if (attributeInfo.FileAttributes != INVALID_FILE_ATTRIBUTES && !(attributeInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) && (flags & O_DIRECTORY))
+	else if (!(attribute_info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) && (flags & O_DIRECTORY))
 	{
 		log_warning("Not a directory.\n");
 		return -ENOTDIR;
 	}
+	*hFile = handle;
+	return 0;
+}
 
-after_symlink_test:
-	if (!is_symlink && (flags & O_TRUNC) && ((flags & O_WRONLY) || (flags & O_RDWR)))
+static int winfs_open(struct file_system *fs, const char *pathname, int flags, int mode, struct file **fp, char *target, int buflen)
+{
+	/* TODO: mode */
+	DWORD desired_access, create_disposition;
+	HANDLE handle;
+
+	if (flags & O_PATH)
+		desired_access = 0;
+	else if (flags & O_RDWR)
+		desired_access = GENERIC_READ | GENERIC_WRITE;
+	else if (flags & O_WRONLY)
+		desired_access = GENERIC_WRITE;
+	else
+		desired_access = GENERIC_READ;
+	if (flags & __O_DELETE)
+		desired_access |= DELETE;
+	if (flags & O_EXCL)
+		create_disposition = FILE_CREATE;
+	else if (flags & O_CREAT)
+		create_disposition = FILE_OPEN_IF;
+	else
+		create_disposition = FILE_OPEN;
+	int r = open_file(&handle, pathname, desired_access, create_disposition, flags, fp != NULL, target, buflen);
+	if (r < 0 || r == 1)
+		return r;
+	if ((flags & O_TRUNC) && ((flags & O_WRONLY) || (flags & O_RDWR)))
 	{
 		/* Truncate the file */
 		FILE_END_OF_FILE_INFORMATION info;
@@ -906,10 +1000,9 @@ after_symlink_test:
 
 	if (fp)
 	{
-		file = (struct winfs_file *)kmalloc(sizeof(struct winfs_file) + pathlen);
-		file->base_file.op_vtable = &winfs_ops;
-		file->base_file.ref = 1;
-		file->base_file.flags = flags;
+		int pathlen = strlen(pathname);
+		struct winfs_file *file = (struct winfs_file *)kmalloc(sizeof(struct winfs_file) + pathlen);
+		file_init(&file->base_file, &winfs_ops, flags);
 		file->handle = handle;
 		file->restart_scan = 1;
 		file->pathlen = pathlen;

@@ -97,15 +97,15 @@ struct instruction_desc
 			int read_regs; /* The bitmask of registers which are read from */
 			int write_regs; /* The bitmask of registers which are written to */
 		};
-		struct instruction_desc *extension_table; /* Secondary lookup table for INST_TYPE_EXTENSION */
+		const struct instruction_desc *extension_table; /* Secondary lookup table for INST_TYPE_EXTENSION */
 	};
 };
 #define UNKNOWN()		{ .type = INST_TYPE_UNKNOWN },
 #define INVALID()		{ .type = INST_TYPE_INVALID },
 #define UNSUPPORTED()	{ .type = INST_TYPE_UNSUPPORTED },
-#define MANDATORY(x)	{ .type = INST_TYPE_MANDATORY, .extension_table = &mandatory_##x },
+#define MANDATORY(x)	{ .type = INST_TYPE_MANDATORY, .extension_table = mandatory_##x },
 #define X87()			{ .type = INST_TYPE_X87 },
-#define EXTENSION(x)	{ .type = INST_TYPE_EXTENSION, .has_modrm = 1, .extension_table = &extension_##x },
+#define EXTENSION(x)	{ .type = INST_TYPE_EXTENSION, .has_modrm = 1, .extension_table = extension_##x },
 
 #define INST(...)		{ .type = INST_TYPE_NORMAL, __VA_ARGS__ },
 #define SPECIAL(s, ...)	{ .type = s, __VA_ARGS__ },
@@ -453,7 +453,7 @@ static const struct instruction_desc one_byte_inst[256] =
 	/* 0xC7: */ EXTENSION(C7)
 	/* 0xC8: ENTER */ UNSUPPORTED()
 	/* 0xC9: LEAVE */ INST(READ(REG_BP), WRITE(REG_BP | REG_SP))
-	/* 0xCA: RET FAR imm16 */ UNSUPPORTED(IMM(2))
+	/* 0xCA: RET FAR imm16 */ UNSUPPORTED()
 	/* 0xCB: RET FAR */ UNSUPPORTED()
 	/* 0xCC: INT 3 */ INST()
 	/* 0xCD: INT */ SPECIAL(INST_INT, IMM(1))
@@ -837,8 +837,8 @@ static const struct instruction_desc mandatory_0x0F7F[4] =
 
 static const struct instruction_desc extension_0xAE[8] =
 {
-	/* 0: ??? */ UNKNOWN()
-	/* 1: ??? */ UNKNOWN()
+	/* 0: FXSAVE */ INST(MODRM(), WRITE(MODRM_RM_M))
+	/* 1: FXRSTOR */ INST(MODRM(), READ(MODRM_RM_M))
 	/* 2: LDMXCSR m32 */ INST(MODRM(), READ(MODRM_RM_M))
 	/* 3: STMXCSR m32 */ INST(MODRM(), WRITE(MODRM_RM_M))
 	/* 4: mem: XSAVE mem */ INST(MODRM(), WRITE(MODRM_RM_M))
@@ -1131,7 +1131,7 @@ static const struct instruction_desc two_byte_inst[256] =
 	/* 0xB0: CMPXCHG r/m8, r8 */ INST(MODRM(), READ(MODRM_R | MODRM_RM | REG_AX), WRITE(MODRM_RM | REG_AX))
 	/* 0xB1: CMPXCHG r/m?, r? */ INST(MODRM(), READ(MODRM_R | MODRM_RM | REG_AX), WRITE(MODRM_RM | REG_AX))
 	/* 0xB2: LSS r?, m16:? */ UNSUPPORTED()
-	/* 0xB3: BTR r/m?, r? */ INST(MODRM(), IMM(1), READ(MODRM_RM))
+	/* 0xB3: BTR r/m?, r? */ INST(MODRM(), READ(MODRM_RM))
 	/* 0xB4: LFS r?, m16:? */ UNSUPPORTED()
 	/* 0xB5: LGS r?, m16:? */ UNSUPPORTED()
 	/* 0xB6: MOVZX r?, r/m8 */ INST(MODRM(), READ(MODRM_RM), WRITE(MODRM_R))

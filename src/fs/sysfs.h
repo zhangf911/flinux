@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include <stddef.h>
+#include <fs/virtual.h>
 
-#define container_of(ptr, type, member) \
-	(type *)((char *)(ptr) - offsetof(type, member))
+struct file_system *sysfs_alloc();

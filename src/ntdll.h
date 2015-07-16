@@ -7,7 +7,10 @@
 typedef LONG NTSTATUS;
 
 #define STATUS_SUCCESS					0x00000000
+#define STATUS_OBJECT_NAME_EXISTS		0x40000000
 #define STATUS_NO_MORE_FILES			0x80000006
+#define STATUS_ACCESS_DENIED			0xC0000022
+#define STATUS_OBJECT_NAME_COLLISION	0xC0000035
 #define STATUS_SHARING_VIOLATION		0xC0000043
 
 #ifndef NT_SUCCESS
@@ -106,6 +109,77 @@ NTSYSAPI NTSTATUS NTAPI NtQueryObject(
 
 NTSYSAPI NTSTATUS NTAPI NtClose(
 	_In_		HANDLE ObjectHandle
+	);
+
+/* System information */
+typedef enum _SYSTEM_INFORMATION_CLASS {
+	SystemBasicInformation,
+	SystemProcessorInformation,
+	SystemPerformanceInformation,
+	SystemTimeOfDayInformation,
+	SystemPathInformation,
+	SystemProcessInformation,
+	SystemCallCountInformation,
+	SystemDeviceInformation,
+	SystemProcessorPerformanceInformation,
+	SystemFlagsInformation,
+	SystemCallTimeInformation,
+	SystemModuleInformation,
+	SystemLocksInformation,
+	SystemStackTraceInformation,
+	SystemPagedPoolInformation,
+	SystemNonPagedPoolInformation,
+	SystemHandleInformation,
+	SystemObjectInformation,
+	SystemPageFileInformation,
+	SystemVdmInstemulInformation,
+	SystemVdmBopInformation,
+	SystemFileCacheInformation,
+	SystemPoolTagInformation,
+	SystemInterruptInformation,
+	SystemDpcBehaviorInformation,
+	SystemFullMemoryInformation,
+	SystemLoadGdiDriverInformation,
+	SystemUnloadGdiDriverInformation,
+	SystemTimeAdjustmentInformation,
+	SystemSummaryMemoryInformation,
+	SystemNextEventIdInformation,
+	SystemEventIdsInformation,
+	SystemCrashDumpInformation,
+	SystemExceptionInformation,
+	SystemCrashDumpStateInformation,
+	SystemKernelDebuggerInformation,
+	SystemContextSwitchInformation,
+	SystemRegistryQuotaInformation,
+	SystemExtendServiceTableInformation,
+	SystemPrioritySeperation,
+	SystemPlugPlayBusInformation,
+	SystemDockInformation
+} SYSTEM_INFORMATION_CLASS, *PSYSTEM_INFORMATION_CLASS;
+
+typedef struct _SYSTEM_TIMEOFDAY_INFORMATION {
+	LARGE_INTEGER BootTime;
+	LARGE_INTEGER CurrentTime;
+	LARGE_INTEGER TimeZoneBias;
+	ULONG TimeZoneId;
+	ULONG Reserved;
+	ULONGLONG BootTimeBias;
+	ULONGLONG SleepTimeBias;
+} SYSTEM_TIMEOFDAY_INFORMATION, *PSYSTEM_TIMEOFDAY_INFORMATION;
+
+typedef struct _SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION {
+	LARGE_INTEGER IdleTime;
+	LARGE_INTEGER KernelTime;
+	LARGE_INTEGER UserTime;
+	LARGE_INTEGER Reserved1[2];
+	ULONG Reserved2;
+} SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION, *PSYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+
+NTSYSAPI NTSTATUS NTAPI NtQuerySystemInformation(
+	_In_		SYSTEM_INFORMATION_CLASS SystemInformationClass,
+	_Inout_		PVOID SystemInformation,
+	_In_		ULONG SystemInformationLength,
+	_Out_opt_	PULONG ReturnLength
 	);
 
 /* File API */
@@ -261,6 +335,11 @@ typedef struct _FILE_END_OF_FILE_INFORMATION {
 	LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
 
+typedef struct _FILE_ATTRIBUTE_TAG_INFORMATION {
+	ULONG FileAttributes;
+	ULONG ReparseTag;
+} FILE_ATTRIBUTE_TAG_INFORMATION, *PFILE_ATTRIBUTE_TAG_INFORMATION;
+
 typedef struct _FILE_ID_FULL_DIR_INFORMATION {
 	ULONG         NextEntryOffset;
 	ULONG         FileIndex;
@@ -413,6 +492,13 @@ NTSYSAPI NTSTATUS NTAPI NtUnmapViewOfSection(
 	);
 
 /* Thread */
+typedef struct _CLIENT_ID {
+	HANDLE UniqueProcess;
+	HANDLE UniqueThread;
+} CLIENT_ID;
+
+typedef LONG KPRIORITY;
+
 NTSYSAPI NTSTATUS NTAPI NtDelayExecution(
 	_In_		BOOLEAN Alertable,
 	_In_		PLARGE_INTEGER DelayInterval
@@ -422,6 +508,44 @@ NTSYSAPI NTSTATUS NTAPI NtQueryTimerResolution(
 	_Out_		PULONG MinimumResolution,
 	_Out_		PULONG MaximumResolution,
 	_Out_		PULONG ActualResolution
+	);
+
+typedef enum _NT_THREAD_INFORMATION_CLASS {
+	ThreadBasicInformation,
+	ThreadTimes,
+	ThreadPriority,
+	ThreadBasePriority,
+	ThreadAffinityMask,
+	ThreadImpersonationToken,
+	ThreadDescriptorTableEntry,
+	ThreadEnableAlignmentFaultFixup,
+	ThreadEventPair,
+	ThreadQuerySetWin32StartAddress,
+	ThreadZeroTlsCell,
+	ThreadPerformanceCount,
+	ThreadAmILastThread,
+	ThreadIdealProcessor,
+	ThreadPriorityBoost,
+	ThreadSetTlsArrayAddress,
+	ThreadIsIoPending,
+	ThreadHideFromDebugger,
+} NT_THREAD_INFORMATION_CLASS;
+
+typedef struct _THREAD_BASIC_INFORMATION {
+	NTSTATUS                ExitStatus;
+	PVOID                   TebBaseAddress;
+	CLIENT_ID               ClientId;
+	KAFFINITY               AffinityMask;
+	KPRIORITY               Priority;
+	KPRIORITY               BasePriority;
+} THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
+
+NTSYSAPI NTSTATUS NTAPI NtQueryInformationThread(
+	_In_		HANDLE ThreadHandle,
+	_In_		NT_THREAD_INFORMATION_CLASS ThreadInformationClass,
+	_Inout_		PVOID ThreadInformation,
+	_In_		ULONG ThreadInformationLength,
+	_Out_opt_	PULONG ReturnLength
 	);
 
 /* RTL functions */

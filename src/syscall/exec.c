@@ -91,7 +91,7 @@ static void run(struct binfmt *binary, int argc, char *argv[], int env_size, cha
 		AUX_VEC(AT_ENTRY, executable->load_base + executable->eh.e_entry);
 	else
 		AUX_VEC(AT_ENTRY, executable->eh.e_entry);
-	AUX_VEC(AT_BASE, (interpreter ? interpreter->load_base - interpreter->low : NULL));
+	AUX_VEC(AT_BASE, (interpreter ? (void*)(interpreter->load_base - interpreter->low) : NULL));
 
 	/* environment variables */
 	PTR(NULL);
@@ -131,7 +131,7 @@ static void run(struct binfmt *binary, int argc, char *argv[], int env_size, cha
 	 * When doing an execve we are overwritting the upper part of the stack while relying on the bottom part!!!
 	 * To get proper behaviour, we first have to save and restore esp on kernel/app switches, which is left to be done
 	 */
-	dbt_run(entrypoint, stack);
+	dbt_run(entrypoint, (size_t)stack);
 }
 
 static int load_elf(struct file *f, struct binfmt *binary)
@@ -183,7 +183,7 @@ static int load_elf(struct file *f, struct binfmt *binary)
 		else if (ph->p_type == PT_DYNAMIC)
 			log_info("PT_DYNAMIC: vaddr %p, size %p\n", ph->p_vaddr, ph->p_memsz);
 		else if (ph->p_type == PT_PHDR) /* Patch phdr pointer in PT_PHDR, glibc uses it to determine load offset */
-			ph->p_vaddr = elf->pht;
+			ph->p_vaddr = (size_t)elf->pht;
 	}
 
 	/* Find virtual address range for ET_DYN executable */
@@ -227,14 +227,15 @@ static int load_elf(struct file *f, struct binfmt *binary)
 				prot |= PROT_EXEC;
 			if (eh.e_type == ET_DYN)
 				addr += elf->load_base;
-			mm_mmap(addr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, NULL, 0);
+			mm_mmap((void*)addr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+				MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, 0, NULL, 0);
 			char *vaddr = (char *)ph->p_vaddr;
 			if (eh.e_type == ET_DYN)
 				vaddr += elf->load_base;
 			mm_check_write(vaddr, ph->p_filesz); /* Populate the memory, otherwise pread() will fail */
 			f->op_vtable->pread(f, vaddr, ph->p_filesz, ph->p_offset);
 			if (!binary->interpreter) /* This is not interpreter */
-				mm_update_brk(addr + size);
+				mm_update_brk((void*)(addr + size));
 			if (eh.e_type == ET_EXEC && !load_base_set)
 			{
 				/* Record load base of first segment in ET_EXEC
@@ -331,7 +332,8 @@ static int load_script(struct file *f, struct binfmt *binary)
 	return load_elf(fe, binary);
 }
 
-int do_execve(const char *filename, int argc, char *argv[], int env_size, char *envp[], char *buffer_base)
+int do_execve(const char *filename, int argc, char *argv[], int env_size, char *envp[], char *buffer_base,
+	void (*initialize_routine)())
 {
 	buffer_base = (char*)((uintptr_t)(buffer_base + sizeof(void*) - 1) & -sizeof(void*));
 
@@ -361,9 +363,19 @@ int do_execve(const char *filename, int argc, char *argv[], int env_size, char *
 
 	/* Load file */
 	if (magic[0] == ELFMAG0 && magic[1] == ELFMAG1 && magic[2] == ELFMAG2 && magic[3] == ELFMAG3)
+	{
+		log_info("It is an ELF file.\n");
+		if (initialize_routine)
+			initialize_routine();
 		r = load_elf(f, &binary);
+	}
 	else if (magic[0] == '#' && magic[1] == '!')
+	{
+		log_info("It is a script file.\n");
+		if (initialize_routine)
+			initialize_routine();
 		r = load_script(f, &binary);
+	}
 	else
 	{
 		log_error("Unknown binary magic: %c%c%c%c", magic[0], magic[1], magic[2], magic[3]);
@@ -371,38 +383,52 @@ int do_execve(const char *filename, int argc, char *argv[], int env_size, char *
 	}
 	vfs_release(f);
 	if (r < 0)
-		return r;
+	{
+		log_error("FATAL: Load executable failed, cannot continue.\n");
+		process_exit(1, 0);
+	}
 
 	/* Execute file */
 	if (binary.replace_argv0)
-		argv[0] = filename;
+		argv[0] = (char *)filename;
 	run(&binary, argc, argv, env_size, envp);
-	return 0;
+	return 0; /* Would never reach here */
 }
 
-static char *const startup = (char *)STARTUP_DATA_BASE;
+extern char *startup;
+
+static void execve_initialize_routine()
+{
+	vfs_reset();
+	mm_reset();
+	tls_reset();
+	dbt_reset();
+}
+
+static char *flip_startup_base()
+{
+	if (*(uintptr_t*)startup)
+	{
+		*(uintptr_t*)startup = 0;
+		*(uintptr_t*)(startup + (BLOCK_SIZE / 2)) = 1;
+		return startup + (BLOCK_SIZE / 2) + sizeof(uintptr_t);
+	}
+	else
+	{
+		*(uintptr_t*)(startup + (BLOCK_SIZE / 2)) = 0;
+		*(uintptr_t*)startup = 1;
+		return startup + sizeof(uintptr_t);
+	}
+}
 
 DEFINE_SYSCALL(execve, const char *, filename, char **, argv, char **, envp)
 {
 	/* TODO: Deal with argv/envp == NULL */
 	/* TODO: Don't destroy things on failure */
 	log_info("execve(%s, %p, %p)\n", filename, argv, envp);
-	log_info("Reinitializing...\n");
 
 	/* Copy argv[] and envp[] to startup data */
-	char *current_startup_base;
-	if (*(uintptr_t*)startup)
-	{
-		*(uintptr_t*)startup = 0;
-		*(uintptr_t*)(startup + (BLOCK_SIZE / 2)) = 1;
-		current_startup_base = startup + (BLOCK_SIZE / 2) + sizeof(uintptr_t);
-	}
-	else
-	{
-		*(uintptr_t*)(startup + (BLOCK_SIZE / 2)) = 0;
-		*(uintptr_t*)startup = 1;
-		current_startup_base = startup + sizeof(uintptr_t);
-	}
+	char *current_startup_base = flip_startup_base();
 
 	/* Save filename in startup data area */
 	int flen = strlen(filename);
@@ -413,17 +439,9 @@ DEFINE_SYSCALL(execve, const char *, filename, char **, argv, char **, envp)
 	char *base = current_startup_base;
 	int argc, env_size;
 	for (argc = 0; argv[argc]; argc++)
-	{
 		base += strlen(argv[argc]) + 1;
-		log_info("argv[%d] = \"%s\"\n", argc, argv[argc]);
-	}
-	log_info("argc = %d\n", argc);
 	for (env_size = 0; envp[env_size]; env_size++)
-	{
 		base += strlen(envp[env_size]) + 1;
-		log_info("envp[%d] = \"%s\"\n", env_size, envp[env_size]);
-	}
-	log_info("env_size = %d\n", env_size);
 
 	/* TODO: Test if we have enough size to hold the startup data */
 	
@@ -448,16 +466,25 @@ DEFINE_SYSCALL(execve, const char *, filename, char **, argv, char **, envp)
 	}
 	new_envp[env_size] = NULL;
 
+	for (int i = 0; i < argc; i++)
+		log_info("argv[%d] = \"%s\"\n", i, new_argv[i]);
+	for (int i = 0; i < env_size; i++)
+		log_info("envp[%d] = \"%s\"\n", i, new_envp[i]);
+
 	base = (char *)(new_envp + env_size + 1);
 
-	vfs_reset();
-	mm_reset();
-	tls_reset();
-	dbt_reset();
-	if (do_execve(filename, argc, new_argv, env_size, new_envp, base) != 0)
+	int r = do_execve(filename, argc, new_argv, env_size, new_envp, base, execve_initialize_routine);
+	if (r < 0) /* Should always be the case */
 	{
 		log_warning("execve() failed.\n");
-		ExitProcess(0); /* TODO: Recover */
+		flip_startup_base();
 	}
-	return 0;
+	return r;
+}
+
+int exec_fork(HANDLE process)
+{
+	if (!WriteProcessMemory(process, &startup, &startup, sizeof(startup), NULL))
+		return 0;
+	return 1;
 }

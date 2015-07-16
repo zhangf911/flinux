@@ -35,7 +35,7 @@ struct pipe_file
 	int is_read;
 };
 
-static HANDLE pipe_get_poll_handle(struct file *f, int **poll_flags)
+static HANDLE pipe_get_poll_handle(struct file *f, int *poll_flags)
 {
 	struct pipe_file *pipe = (struct pipe_file *) f;
 	if (pipe->is_read)
@@ -53,13 +53,16 @@ static int pipe_close(struct file *f)
 	return 0;
 }
 
-static size_t pipe_read(struct file *f, char *buf, size_t count)
+static size_t pipe_read(struct file *f, void *buf, size_t count)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct pipe_file *pipe = (struct pipe_file *)f;
+	ssize_t r;
 	if (!pipe->is_read)
 	{
 		log_warning("read() on pipe write end.\n");
-		return -EBADF;
+		r = -EBADF;
+		goto out;
 	}
 	size_t num_read;
 	if (!ReadFile(pipe->handle, buf, count, &num_read, NULL))
@@ -67,20 +70,27 @@ static size_t pipe_read(struct file *f, char *buf, size_t count)
 		if (GetLastError() == ERROR_BROKEN_PIPE)
 		{
 			log_info("Pipe closed. Read returns 0.\n");
-			return 0;
+			r = 0;
+			goto out;
 		}
-		return -EIO;
+		r = -EIO;
+		goto out;
 	}
-	return num_read;
+	r = num_read;
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
+	return r;
 }
 
-static size_t pipe_write(struct file *f, const char *buf, size_t count)
+static size_t pipe_write(struct file *f, const void *buf, size_t count)
 {
+	AcquireSRWLockShared(&f->rw_lock);
 	struct pipe_file *pipe = (struct pipe_file *)f;
+	ssize_t r;
 	if (pipe->is_read)
 	{
 		log_warning("write() on pipe read end.\n");
-		return -EBADF;
+		r = -EBADF;
 	}
 	size_t num_written;
 	if (!WriteFile(pipe->handle, buf, count, &num_written, NULL))
@@ -89,10 +99,15 @@ static size_t pipe_write(struct file *f, const char *buf, size_t count)
 		{
 			log_info("Write failed: broken pipe.\n");
 			/* TODO: Send SIGPIPE signal */
-			return -EPIPE;
+			r = -EPIPE;
+			goto out;
 		}
-		return -EIO;
+		r = -EIO;
+		goto out;
 	}
+	r = num_written;
+out:
+	ReleaseSRWLockShared(&f->rw_lock);
 	return num_written;
 }
 
@@ -135,12 +150,10 @@ static const struct file_ops pipe_ops = {
 static struct file *pipe_create_file(HANDLE handle, int is_read, int flags)
 {
 	struct pipe_file *pipe = (struct pipe_file *)kmalloc(sizeof(struct pipe_file));
-	pipe->base_file.op_vtable = &pipe_ops;
-	pipe->base_file.ref = 1;
-	pipe->base_file.flags = is_read? O_RDONLY: O_WRONLY;
+	file_init(&pipe->base_file, &pipe_ops, is_read ? O_RDONLY: O_WRONLY);
 	pipe->handle = handle;
 	pipe->is_read = is_read;
-	return pipe;
+	return (struct file *)pipe;
 }
 
 int pipe_alloc(struct file **fread, struct file **fwrite, int flags)

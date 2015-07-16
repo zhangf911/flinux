@@ -20,12 +20,18 @@
 #include <common/errno.h>
 #include <common/fadvise.h>
 #include <common/fcntl.h>
+#include <common/ioctls.h>
 #include <fs/console.h>
 #include <fs/devfs.h>
+#include <fs/epollfd.h>
+#include <fs/eventfd.h>
 #include <fs/pipe.h>
+#include <fs/procfs.h>
 #include <fs/socket.h>
+#include <fs/sysfs.h>
 #include <fs/winfs.h>
 #include <syscall/mm.h>
+#include <syscall/sig.h>
 #include <syscall/syscall.h>
 #include <syscall/vfs.h>
 #include <datetime.h>
@@ -36,6 +42,8 @@
 #include <Windows.h>
 #include <limits.h>
 #include <malloc.h>
+
+#include <stdlib.h>
 
 /* Notes on symlink solving:
 
@@ -50,16 +58,22 @@
    a component, the whole operation immediately fails.
 */
 
+struct filed
+{
+	struct file *fd;
+	int cloexec;
+};
+
 struct vfs_data
 {
-	struct file *fds[MAX_FD_COUNT];
-	int fds_cloexec[MAX_FD_COUNT];
+	SRWLOCK rw_lock;
+	struct filed filed[MAX_FD_COUNT];
 	struct file_system *fs_first;
 	struct file *cwd;
 	int umask;
 };
 
-static struct vfs_data * const vfs = VFS_DATA_BASE;
+static struct vfs_data *vfs;
 
 static void vfs_add(struct file_system *fs)
 {
@@ -67,49 +81,76 @@ static void vfs_add(struct file_system *fs)
 	vfs->fs_first = fs;
 }
 
-/* Get file handle to a fd */
-struct file *vfs_get(int fd)
-{
-	if (fd < 0 || fd >= MAX_FD_COUNT)
-		return NULL;
-	return vfs->fds[fd];
-}
-
 /* Reference a file, only used on raw file handles not created by sys_open() */
 void vfs_ref(struct file *f)
 {
-	f->ref++;
+	InterlockedIncrement(&f->ref);
 }
 
 /* Release a file, only used on raw file handles not created by sys_open() */
 void vfs_release(struct file *f)
 {
-	if (--f->ref == 0)
+	if (InterlockedDecrement(&f->ref) == 0)
 		f->op_vtable->close(f);
 }
 
-/* Close a file descriptor fd */
-void vfs_close(int fd)
+/* Get file handle to a fd (caller locks vfs, either exclusive or shared is okay) */
+static struct file *vfs_get_internal(int fd)
 {
-	struct file *f = vfs->fds[fd];
+	if (fd < 0 || fd >= MAX_FD_COUNT)
+		return NULL;
+	struct file *f = vfs->filed[fd].fd;
+	if (f)
+		vfs_ref(f);
+	return f;
+}
+
+/* Get file handle to a fd */
+struct file *vfs_get(int fd)
+{
+	if (fd < 0 || fd >= MAX_FD_COUNT)
+		return NULL;
+	AcquireSRWLockShared(&vfs->rw_lock);
+	struct file *f = vfs->filed[fd].fd;
+	if (f)
+		vfs_ref(f);
+	ReleaseSRWLockShared(&vfs->rw_lock);
+	return f;
+}
+
+/* Close a file descriptor fd */
+static void vfs_close(int fd)
+{
+	struct file *f = vfs->filed[fd].fd;
 	vfs_release(f);
-	vfs->fds[fd] = NULL;
-	vfs->fds_cloexec[fd] = 0;
+	vfs->filed[fd].fd = NULL;
+	vfs->filed[fd].cloexec = 0;
+}
+
+static __inline void vfs_handle_fork(struct file *f)
+{
+	if (f && f->op_vtable->after_fork)
+	{
+		f->op_vtable->after_fork(f);
+	}
 }
 
 void vfs_init()
 {
 	log_info("vfs subsystem initializing...\n");
-	mm_mmap(VFS_DATA_BASE, sizeof(struct vfs_data), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, 0, NULL, 0);
+	vfs = mm_static_alloc(sizeof(struct vfs_data));
+	InitializeSRWLock(&vfs->rw_lock);
 	struct file *console_in, *console_out;
 	console_init();
 	struct file *console = console_alloc();
 	console->ref += 2;
-	vfs->fds[0] = console;
-	vfs->fds[1] = console;
-	vfs->fds[2] = console;
+	vfs->filed[0].fd = console;
+	vfs->filed[1].fd = console;
+	vfs->filed[2].fd = console;
 	vfs_add(winfs_alloc());
 	vfs_add(devfs_alloc());
+	vfs_add(procfs_alloc());
+	vfs_add(sysfs_alloc());
 	/* Initialize CWD */
 	if (vfs_openat(AT_FDCWD, "/", O_DIRECTORY | O_PATH, 0, &vfs->cwd) < 0)
 	{
@@ -126,8 +167,8 @@ void vfs_reset()
 	/* Handle O_CLOEXEC */
 	for (int i = 0; i < MAX_FD_COUNT; i++)
 	{
-		struct file *f = vfs->fds[i];
-		if (f && vfs->fds_cloexec[i])
+		struct file *f = vfs->filed[i].fd;
+		if (f && vfs->filed[i].cloexec)
 			vfs_close(i);
 	}
 	vfs->umask = S_IWGRP | S_IWOTH;
@@ -137,31 +178,98 @@ void vfs_shutdown()
 {
 	for (int i = 0; i < MAX_FD_COUNT; i++)
 	{
-		struct file *f = vfs->fds[i];
+		struct file *f = vfs->filed[i].fd;
 		if (f)
 			vfs_close(i);
 	}
 	socket_shutdown();
-	mm_munmap(VFS_DATA_BASE, sizeof(struct vfs_data));
 }
 
 int vfs_fork(HANDLE process)
 {
 	if (!console_fork(process))
 		return 0;
+	AcquireSRWLockShared(&vfs->rw_lock);
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+		if (vfs->filed[i].fd)
+			AcquireSRWLockShared(&vfs->filed[i].fd->rw_lock);
 	return 1;
+}
+
+static int cmpfiled(const void *a, const void *b)
+{
+	int fda = *(int *)a;
+	int fdb = *(int *)b;
+
+	struct file *filea = vfs->filed[fda].fd;
+	struct file *fileb = vfs->filed[fdb].fd;
+
+	if (filea > fileb)
+	{
+		return 1;
+	}
+	else if (filea < fileb)
+	{
+		return -1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+void vfs_afterfork_child()
+{
+	vfs = mm_static_alloc(sizeof(struct vfs_data));
+	InitializeSRWLock(&vfs->rw_lock);
+	console_afterfork();
+
+	int index[MAX_FD_COUNT];
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+	{
+		index[i] = i;
+	}
+
+	qsort(index, MAX_FD_COUNT, sizeof(int), cmpfiled);
+
+	struct file *last = NULL;
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+	{
+		struct file *f = vfs->filed[index[i]].fd;
+		if (f && f != last)
+		{
+			vfs_handle_fork(f);
+		}
+		last = f;
+	}
+}
+
+void vfs_afterfork_parent()
+{
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+		if (vfs->filed[i].fd)
+			ReleaseSRWLockShared(&vfs->filed[i].fd->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
+}
+
+static int store_file_internal(struct file *f, int cloexec)
+{
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+		if (vfs->filed[i].fd == NULL)
+		{
+			vfs->filed[i].fd = f;
+			vfs->filed[i].cloexec = cloexec;
+			return i;
+		}
+	return -EMFILE;
 }
 
 int vfs_store_file(struct file *f, int cloexec)
 {
-	for (int i = 0; i < MAX_FD_COUNT; i++)
-		if (vfs->fds[i] == NULL)
-		{
-			vfs->fds[i] = f;
-			vfs->fds_cloexec[i] = cloexec;
-			return i;
-		}
-	return -EMFILE;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	int r = store_file_internal(f, cloexec);
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(pipe2, int *, pipefd, int, flags)
@@ -180,30 +288,36 @@ DEFINE_SYSCALL(pipe2, int *, pipefd, int, flags)
 	}
 	if (!mm_check_write(pipefd, 2 * sizeof(int)))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *fread, *fwrite;
 	int r = pipe_alloc(&fread, &fwrite, flags);
 	if (r < 0)
-		return r;
+		goto out;
 	/* TODO: Deal with EMFILE error */
-	int rfd = vfs_store_file(fread, (flags & O_CLOEXEC) > 0);
+	int rfd = store_file_internal(fread, (flags & O_CLOEXEC) > 0);
 	if (rfd < 0)
 	{
 		vfs_release(fread);
 		vfs_release(fwrite);
-		return rfd;
+		r = rfd;
+		goto out;
 	}
-	int wfd = vfs_store_file(fwrite, (flags & O_CLOEXEC) > 0);
+	int wfd = store_file_internal(fwrite, (flags & O_CLOEXEC) > 0);
 	if (wfd < 0)
 	{
 		vfs_close(rfd);
 		vfs_release(fwrite);
-		return wfd;
+		r = wfd;
+		goto out;
 	}
 	pipefd[0] = rfd;
 	pipefd[1] = wfd;
 	log_info("read fd: %d\n", rfd);
 	log_info("write fd: %d\n", wfd);
-	return 0;
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(pipe, int *, pipefd)
@@ -211,32 +325,65 @@ DEFINE_SYSCALL(pipe, int *, pipefd)
 	return sys_pipe2(pipefd, 0);
 }
 
+DEFINE_SYSCALL(eventfd2, unsigned int, count, int, flags)
+{
+	log_info("eventfd2(%u, %d)\n", count, flags);
+
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	struct file* eventfd;
+	int r = eventfd_alloc(&eventfd, count, flags);
+	if (r)
+		goto out;
+
+	r = store_file_internal(eventfd, (flags & O_CLOEXEC) > 0);
+	if (r < 0)
+		vfs_release(eventfd);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
+}
+
 static int vfs_dup(int fd, int newfd, int flags)
 {
-	struct file *f = vfs_get(fd);
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	struct file *f = vfs_get_internal(fd);
 	if (!f)
-		return -EBADF;
+	{
+		newfd = -EBADF;
+		goto out;
+	}
 	if (newfd == -1)
 	{
 		for (int i = 0; i < MAX_FD_COUNT; i++)
-			if (vfs->fds[i] == NULL)
+			if (vfs->filed[i].fd == NULL)
 			{
 				newfd = i;
 				break;
 			}
 		if (newfd == -1)
-			return -EMFILE;
+		{
+			newfd = -EMFILE;
+			vfs_release(f);
+			goto out;
+		}
 	}
 	else
 	{
 		if (newfd == fd || newfd < 0 || newfd >= MAX_FD_COUNT)
-			return -EINVAL;
-		if (vfs->fds[newfd])
+		{
+			newfd = -EINVAL;
+			vfs_release(f);
+			goto out;
+		}
+		if (vfs->filed[newfd].fd)
 			vfs_close(newfd);
 	}
-	vfs->fds[newfd] = f;
-	vfs->fds_cloexec[newfd] = !!(flags & O_CLOEXEC);
-	f->ref++;
+	vfs->filed[newfd].fd = f;
+	vfs->filed[newfd].cloexec = !!(flags & O_CLOEXEC);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return newfd;
 }
 
@@ -261,170 +408,211 @@ DEFINE_SYSCALL(dup3, int, fd, int, newfd, int, flags)
 DEFINE_SYSCALL(read, int, fd, char *, buf, size_t, count)
 {
 	log_info("read(%d, %p, %p)\n", fd, buf, count);
-	struct file *f = vfs->fds[fd];
+	if (!mm_check_write(buf, count))
+		return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->read)
-	{
-		if (!mm_check_write(buf, count))
-			return -EFAULT;
-		return f->op_vtable->read(f, buf, count);
-	}
+		r = f->op_vtable->read(f, buf, count);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(write, int, fd, const char *, buf, size_t, count)
 {
 	log_info("write(%d, %p, %p)\n", fd, buf, count);
-	struct file *f = vfs->fds[fd];
+	if (!mm_check_read(buf, count))
+		return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->write)
-	{
-		if (!mm_check_read(buf, count))
-			return -EFAULT;
-		return f->op_vtable->write(f, buf, count);
-	}
+		r = f->op_vtable->write(f, buf, count);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(pread64, int, fd, char *, buf, size_t, count, loff_t, offset)
 {
 	log_info("pread64(%d, %p, %p, %lld)\n", fd, buf, count, offset);
-	struct file *f = vfs->fds[fd];
+	if (!mm_check_write(buf, count))
+		return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->pread)
-	{
-		if (!mm_check_write(buf, count))
-			return -EFAULT;
-		return f->op_vtable->pread(f, buf, count, offset);
-	}
+		r = f->op_vtable->pread(f, buf, count, offset);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(pwrite64, int, fd, const char *, buf, size_t, count, loff_t, offset)
 {
 	log_info("pwrite64(%d, %p, %p, %lld)\n", fd, buf, count, offset);
-	struct file *f = vfs->fds[fd];
+	if (!mm_check_read(buf, count))
+		return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->pwrite)
-	{
-		if (!mm_check_read(buf, count))
-			return -EFAULT;
-		return f->op_vtable->pwrite(f, buf, count, offset);
-	}
+		r = f->op_vtable->pwrite(f, buf, count, offset);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(readv, int, fd, const struct iovec *, iov, int, iovcnt)
 {
 	log_info("readv(%d, 0x%p, %d)\n", fd, iov, iovcnt);
-	struct file *f = vfs->fds[fd];
+	for (int i = 0; i < iovcnt; i++)
+		if (!mm_check_write(iov[i].iov_base, iov[i].iov_len))
+			return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->read)
 	{
-		for (int i = 0; i < iovcnt; i++)
-			if (!mm_check_write(iov[i].iov_base, iov[i].iov_len))
-				return -EFAULT;
-		size_t count = 0;
+		r = 0;
 		for (int i = 0; i < iovcnt; i++)
 		{
-			int r = f->op_vtable->read(f, iov[i].iov_base, iov[i].iov_len);
-			if (r < 0)
-				return r;
-			count += r;
-			if (r < iov[i].iov_len)
-				return count;
+			ssize_t cur = f->op_vtable->read(f, iov[i].iov_base, iov[i].iov_len);
+			if (cur < 0)
+			{
+				r = cur;
+				break;
+			}
+			r += cur;
+			if (cur < iov[i].iov_len)
+				break;
 		}
-		return count;
 	}
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(writev, int, fd, const struct iovec *, iov, int, iovcnt)
 {
 	log_info("writev(%d, 0x%p, %d)\n", fd, iov, iovcnt);
-	struct file *f = vfs->fds[fd];
+	for (int i = 0; i < iovcnt; i++)
+		if (!mm_check_read(iov[i].iov_base, iov[i].iov_len))
+			return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->write)
 	{
-		for (int i = 0; i < iovcnt; i++)
-			if (!mm_check_read(iov[i].iov_base, iov[i].iov_len))
-				return -EFAULT;
-		size_t count = 0;
+		r = 0;
 		for (int i = 0; i < iovcnt; i++)
 		{
-			int r = f->op_vtable->write(f, iov[i].iov_base, iov[i].iov_len);
-			if (r < 0)
-				return r;
-			count += r;
-			if (r < iov[i].iov_len)
-				return count;
+			ssize_t cur = f->op_vtable->write(f, iov[i].iov_base, iov[i].iov_len);
+			if (cur < 0)
+			{
+				r = cur;
+				break;
+			}
+			r += cur;
+			if (cur < iov[i].iov_len)
+				break;
 		}
-		return count;
 	}
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(preadv, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset)
 {
 	log_info("preadv(%d, 0x%p, %d, 0x%x)\n", fd, iov, iovcnt, offset);
-	struct file *f = vfs->fds[fd];
+	for (int i = 0; i < iovcnt; i++)
+		if (!mm_check_write(iov[i].iov_base, iov[i].iov_len))
+			return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->pread)
 	{
-		for (int i = 0; i < iovcnt; i++)
-			if (!mm_check_write(iov[i].iov_base, iov[i].iov_len))
-				return -EFAULT;
-		size_t count = 0;
+		r = 0;
 		for (int i = 0; i < iovcnt; i++)
 		{
-			int r = f->op_vtable->pread(f, iov[i].iov_base, iov[i].iov_len, offset);
+			ssize_t cur = f->op_vtable->pread(f, iov[i].iov_base, iov[i].iov_len, offset);
 			if (r < 0)
-				return r;
-			count += r;
-			offset += r;
-			if (r < iov[i].iov_len)
-				return count;
+			{
+				r = cur;
+				break;
+			}
+			r += cur;
+			offset += cur;
+			if (cur < iov[i].iov_len)
+				break;
 		}
-		return count;
 	}
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(pwritev, int, fd, const struct iovec *, iov, int, iovcnt, off_t, offset)
 {
 	log_info("pwritev(%d, 0x%p, %d, 0x%x)\n", fd, iov, iovcnt, offset);
-	struct file *f = vfs->fds[fd];
+	for (int i = 0; i < iovcnt; i++)
+		if (!mm_check_read(iov[i].iov_base, iov[i].iov_len))
+			return -EFAULT;
+	struct file *f = vfs_get(fd);
+	ssize_t r;
 	if (f && f->op_vtable->pwrite)
 	{
-		for (int i = 0; i < iovcnt; i++)
-			if (!mm_check_read(iov[i].iov_base, iov[i].iov_len))
-				return -EFAULT;
-		size_t count = 0;
+		r = 0;
 		for (int i = 0; i < iovcnt; i++)
 		{
-			int r = f->op_vtable->pwrite(f, iov[i].iov_base, iov[i].iov_len, offset);
-			if (r < 0)
-				return r;
-			count += r;
-			offset += r;
-			if (r < iov[i].iov_len)
-				return count;
+			ssize_t cur = f->op_vtable->pwrite(f, iov[i].iov_base, iov[i].iov_len, offset);
+			if (cur < 0)
+			{
+				r = cur;
+				break;
+			}
+			r += cur;
+			offset += cur;
+			if (cur < iov[i].iov_len)
+				break;
 		}
-		return count;
 	}
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(truncate, const char *, path, off_t, length)
 {
 	log_info("truncate(\"%s\", %p)\n", path, length);
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
+	if (!f->op_vtable->truncate)
+	{
+		r = -EPERM;
+		goto out;
+	}
 	r = f->op_vtable->truncate(f, length);
 	vfs_release(f);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -432,20 +620,34 @@ DEFINE_SYSCALL(ftruncate, int, fd, off_t, length)
 {
 	log_info("ftruncate(%d, %p)\n", fd, length);
 	struct file *f = vfs_get(fd);
-	if (!f)
-		return -EBADF;
-	return f->op_vtable->truncate(f, length);
+	int r;
+	if (f && f->op_vtable->truncate)
+		r = f->op_vtable->truncate(f, length);
+	else
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(truncate64, const char *, path, loff_t, length)
 {
 	log_info("truncate64(\"%s\", %lld)\n", path, length);
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
+	if (!f->op_vtable->truncate)
+	{
+		r = -EPERM;
+		goto out;
+	}
 	r = f->op_vtable->truncate(f, length);
 	vfs_release(f);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -453,73 +655,95 @@ DEFINE_SYSCALL(ftruncate64, int, fd, loff_t, length)
 {
 	log_info("ftruncate(%d, %lld)\n", fd, length);
 	struct file *f = vfs_get(fd);
-	if (!f)
-		return -EBADF;
-	return f->op_vtable->truncate(f, length);
+	int r;
+	if (f && f->op_vtable->truncate)
+		r = f->op_vtable->truncate(f, length);
+	else
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(fsync, int, fd)
 {
 	log_info("fsync(%d)\n", fd);
 	struct file *f = vfs_get(fd);
+	int r;
 	if (!f)
-		return -EBADF;
-	if (!f->op_vtable->fsync)
-		return -EINVAL;
-	return f->op_vtable->fsync(f);
+		r = -EBADF;
+	else if (!f->op_vtable->fsync)
+		r = -EINVAL;
+	else
+		r = f->op_vtable->fsync(f);
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(fdatasync, int, fd)
 {
 	log_info("fdatasync(%d)\n", fd);
 	struct file *f = vfs_get(fd);
+	int r;
 	if (!f)
-		return -EBADF;
-	if (!f->op_vtable->fsync)
-		return -EINVAL;
-	return f->op_vtable->fsync(f);
+		r = -EBADF;
+	else if (!f->op_vtable->fsync)
+		r = -EINVAL;
+	else
+		r = f->op_vtable->fsync(f);
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(lseek, int, fd, off_t, offset, int, whence)
 {
 	log_info("lseek(%d, %d, %d)\n", fd, offset, whence);
-	struct file *f = vfs->fds[fd];
+	struct file *f = vfs_get(fd);
+	intptr_t r;
 	if (f && f->op_vtable->llseek)
 	{
 		loff_t n;
-		int r = f->op_vtable->llseek(f, offset, &n, whence);
+		r = f->op_vtable->llseek(f, offset, &n, whence);
 		if (r < 0)
-			return r;
-		if (n >= INT_MAX)
-			return -EOVERFLOW; /* TODO: Do we need to rollback? */
-		return (off_t) n;
+			/* Nope */;
+		else if (n >= INT_MAX)
+			r = -EOVERFLOW; /* TODO: Do we need to rollback? */
+		else
+			r = (off_t) n;
 	}
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(llseek, int, fd, unsigned long, offset_high, unsigned long, offset_low, loff_t *, result, int, whence)
 {
 	loff_t offset = ((uint64_t) offset_high << 32ULL) + offset_low;
 	log_info("llseek(%d, %lld, %p, %d)\n", fd, offset, result, whence);
-	struct file *f = vfs->fds[fd];
+	if (!mm_check_write(result, sizeof(loff_t)))
+		return -EFAULT;
+	struct file *f = vfs_get(fd);
+	int r = 0;
 	if (f && f->op_vtable->llseek)
-	{
-		if (!mm_check_write(result, sizeof(loff_t)))
-			return -EFAULT;
-		return f->op_vtable->llseek(f, offset, result, whence);
-	}
+		r = f->op_vtable->llseek(f, offset, result, whence);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
-static int find_filesystem(const char *path, struct file_system **out_fs, char **out_subpath)
+static int find_filesystem(const char *path, struct file_system **out_fs, const char **out_subpath)
 {
 	struct file_system *fs;
 	for (fs = vfs->fs_first; fs; fs = fs->next)
 	{
-		char *p = fs->mountpoint;
-		char *subpath = path;
+		const char *p = fs->mountpoint;
+		const char *subpath = path;
 		while (*p && *p == *subpath)
 		{
 			p++;
@@ -602,7 +826,7 @@ static int resolve_path(const char *dirpath, const char *pathname, char *realpat
 						return -ENOTDIR;
 					if (!fs->open)
 						return -ENOTDIR;
-					int r = fs->open(subpath, O_PATH | O_DIRECTORY, 0, NULL, target, PATH_MAX);
+					int r = fs->open(fs, subpath, O_PATH | O_DIRECTORY, 0, NULL, target, PATH_MAX);
 					if (r < 0)
 						return r;
 					else if (r == 0) /* It is a regular file, go forward */
@@ -660,10 +884,12 @@ int resolve_pathat(int dirfd, const char *pathname, char *realpath, int *symlink
 	char dirpath[PATH_MAX];
 	if (pathname[0] != '/')
 	{
-		struct file *f = dirfd == AT_FDCWD? vfs->cwd: vfs_get(dirfd);
+		struct file *f = dirfd == AT_FDCWD? vfs->cwd: vfs_get_internal(dirfd);
 		if (!f)
 			return -EBADF;
 		f->op_vtable->getpath(f, dirpath);
+		if (dirfd != AT_FDCWD)
+			vfs_release(f);
 	}
 	return resolve_path(dirpath, pathname, realpath, symlink_remain);
 }
@@ -717,7 +943,7 @@ int vfs_openat(int dirfd, const char *pathname, int flags, int mode, struct file
 		char *subpath;
 		if (!find_filesystem(realpath, &fs, &subpath))
 			return -ENOENT;
-		int ret = fs->open(subpath, flags, mode, f, target, PATH_MAX);
+		int ret = fs->open(fs, subpath, flags, mode, f, target, PATH_MAX);
 		if (ret <= 0)
 			return ret;
 		else if (ret == 1)
@@ -742,14 +968,19 @@ DEFINE_SYSCALL(openat, int, dirfd, const char *, pathname, int, flags, int, mode
 	log_info("openat(%d, \"%s\", %x, %x)\n", dirfd, pathname, flags, mode);
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(dirfd, pathname, flags, mode, &f);
-	if (r < 0)
-		return r;
-	int fd = vfs_store_file(f, (flags & O_CLOEXEC) > 0);
-	if (fd < 0)
-		vfs_release(f);
-	return fd;
+	if (r >= 0)
+	{
+		r = store_file_internal(f, (flags & O_CLOEXEC) > 0);
+		if (r < 0)
+			vfs_release(f);
+		else
+			log_info("openat() file descriptor id: %d\n", r);
+	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(open, const char *, pathname, int, flags, int, mode)
@@ -767,11 +998,14 @@ DEFINE_SYSCALL(creat, const char *, pathname, int, mode)
 DEFINE_SYSCALL(close, int, fd)
 {
 	log_info("close(%d)\n", fd);
-	struct file *f = vfs->fds[fd];
-	if (!f)
-		return -EBADF;
-	vfs_close(fd);
-	return 0;
+	int r = 0;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	if (!vfs->filed[fd].fd)
+		r = -EBADF;
+	else
+		vfs_close(fd);
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(mknodat, int, dirfd, const char *, pathname, int, mode, unsigned int, dev)
@@ -799,20 +1033,24 @@ DEFINE_SYSCALL(linkat, int, olddirfd, const char *, oldpath, int, newdirfd, cons
 		log_error("AT_EMPTY_PATH not supported.\n");
 		return -EINVAL;
 	}
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int openflags = O_PATH;
 	if (!(openflags & AT_SYMLINK_FOLLOW))
 		openflags |= O_NOFOLLOW;
 	int r = vfs_openat(olddirfd, oldpath, openflags, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	if (!winfs_is_winfile(f))
-		return -EPERM;
+	{
+		r = -EPERM;
+		goto out;
+	}
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	r = resolve_pathat(newdirfd, newpath, realpath, &symlink_remain);
 	if (r < 0)
-		return r;
+		goto out;
 	struct file_system *fs;
 	char *subpath;
 	if (!find_filesystem(realpath, &fs, &subpath))
@@ -820,8 +1058,10 @@ DEFINE_SYSCALL(linkat, int, olddirfd, const char *, oldpath, int, newdirfd, cons
 	else if (!fs->link)
 		r = -EXDEV;
 	else
-		r = fs->link(f, subpath);
+		r = fs->link(fs, f, subpath);
 	vfs_release(f);
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -837,29 +1077,33 @@ DEFINE_SYSCALL(unlinkat, int, dirfd, const char *, pathname, int, flags)
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
 
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	int r = resolve_pathat(dirfd, pathname, realpath, &symlink_remain);
-	if (r < 0)
-		return r;
-	struct file_system *fs;
-	char *subpath;
-	if (!find_filesystem(realpath, &fs, &subpath))
-		return -ENOENT;
-	else if (flags & AT_REMOVEDIR)
+	if (r >= 0)
 	{
-		if (!fs->rmdir)
-			return -EPERM;
+		struct file_system *fs;
+		char *subpath;
+		if (!find_filesystem(realpath, &fs, &subpath))
+			r = -ENOENT;
+		else if (flags & AT_REMOVEDIR)
+		{
+			if (!fs->rmdir)
+				r = -EPERM;
+			else
+				r = fs->rmdir(fs, subpath);
+		}
 		else
-			return fs->rmdir(subpath);
+		{
+			if (!fs->unlink)
+				r = -EPERM;
+			else
+				r = fs->unlink(fs, subpath);
+		}
 	}
-	else
-	{
-		if (!fs->unlink)
-			return -EPERM;
-		else
-			return fs->unlink(subpath);
-	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(unlink, const char *, pathname)
@@ -873,19 +1117,23 @@ DEFINE_SYSCALL(symlinkat, const char *, target, int, newdirfd, const char *, lin
 	log_info("symlinkat(\"%s\", %d, \"%s\")\n", target, newdirfd, linkpath);
 	if (!mm_check_read_string(target) || !mm_check_read_string(linkpath))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	int r = resolve_pathat(newdirfd, linkpath, realpath, &symlink_remain);
-	if (r < 0)
-		return r;
-	struct file_system *fs;
-	char *subpath;
-	if (!find_filesystem(realpath, &fs, &subpath))
-		return -ENOTDIR;
-	else if (!fs->symlink)
-		return -EPERM;
-	else
-		return fs->symlink(target, subpath);
+	if (r >= 0)
+	{
+		struct file_system *fs;
+		char *subpath;
+		if (!find_filesystem(realpath, &fs, &subpath))
+			r = -ENOTDIR;
+		else if (!fs->symlink)
+			r = -EPERM;
+		else
+			r = fs->symlink(fs, target, subpath);
+	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(symlink, const char *, target, const char *, linkpath)
@@ -899,13 +1147,19 @@ DEFINE_SYSCALL(readlinkat, int, dirfd, const char *, pathname, char *, buf, int,
 	log_info("readlinkat(%d, \"%s\", %p, %d)\n", dirfd, pathname, buf, bufsize);
 	if (!mm_check_read_string(pathname) || !mm_check_write(buf, bufsize))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(dirfd, pathname, O_PATH | O_NOFOLLOW, 0, &f);
-	if (r < 0)
-		return r;
-	if (!f->op_vtable->readlink)
-		return -EINVAL;
-	return f->op_vtable->readlink(f, buf, bufsize);
+	if (r >= 0)
+	{
+		if (!f->op_vtable->readlink)
+			r = -EINVAL;
+		else
+			r = f->op_vtable->readlink(f, buf, bufsize);
+		vfs_release(f);
+	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(readlink, const char *, pathname, char *, buf, int, bufsize)
@@ -924,17 +1178,21 @@ DEFINE_SYSCALL(renameat2, int, olddirfd, const char *, oldpath, int, newdirfd, c
 	}
 	if (!mm_check_read_string(oldpath) || !mm_check_read_string(newpath))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(olddirfd, oldpath, O_PATH | O_NOFOLLOW | __O_DELETE, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	if (!winfs_is_winfile(f))
-		return -EPERM;
+	{
+		r = -EPERM;
+		goto out;
+	}
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	r = resolve_pathat(newdirfd, newpath, realpath, &symlink_remain);
 	if (r < 0)
-		return r;
+		goto out;
 	struct file_system *fs;
 	char *subpath;
 	if (!find_filesystem(realpath, &fs, &subpath))
@@ -942,8 +1200,10 @@ DEFINE_SYSCALL(renameat2, int, olddirfd, const char *, oldpath, int, newdirfd, c
 	else if (!fs->rename)
 		r = -EXDEV;
 	else
-		r = fs->rename(f, subpath);
+		r = fs->rename(fs, f, subpath);
 	vfs_release(f);
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -966,6 +1226,7 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, const char *, pathname, int, mode)
 		log_error("mode != 0\n");
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	/* Very special case: mkdir with a tailing slash is equivalent to no tailing slash */
@@ -980,16 +1241,19 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, const char *, pathname, int, mode)
 	}
 	else
 		r = resolve_pathat(dirfd, pathname, realpath, &symlink_remain);
-	if (r < 0)
-		return r;
-	struct file_system *fs;
-	char *subpath;
-	if (!find_filesystem(realpath, &fs, &subpath))
-		return -ENOTDIR;
-	else if (!fs->mkdir)
-		return -EPERM;
-	else
-		return fs->mkdir(subpath, mode);
+	if (r >= 0)
+	{
+		struct file_system *fs;
+		char *subpath;
+		if (!find_filesystem(realpath, &fs, &subpath))
+			r = -ENOTDIR;
+		else if (!fs->mkdir)
+			r = -EPERM;
+		else
+			r = fs->mkdir(fs, subpath, mode);
+	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(mkdir, const char *, pathname, int, mode)
@@ -1004,29 +1268,58 @@ DEFINE_SYSCALL(rmdir, const char *, pathname)
 	return sys_unlinkat(AT_FDCWD, pathname, AT_REMOVEDIR);
 }
 
-static intptr_t getdents_fill(void *buffer, uint64_t inode, const wchar_t *name, int namelen, char type, size_t size)
+static intptr_t getdents_fill(void *buffer, uint64_t inode, const void *name, int namelen, char type, size_t size, int flags)
 {
+	/* For UTF-16, there is guaranteed to be enough room */
+	if (flags & GETDENTS_UTF8)
+	{
+		/* For UTF-8, check whether we have enough room */
+		int reclen = (sizeof(struct linux_dirent) + namelen + 1 + 8) & ~(uintptr_t)8;
+		if (size < reclen)
+			return GETDENTS_ERR_BUFFER_OVERFLOW;
+	}
 	struct linux_dirent *dirent = (struct linux_dirent *)buffer;
 	dirent->d_ino = inode;
 	if (dirent->d_ino != inode)
 		return -EOVERFLOW;
 	dirent->d_off = 0; /* TODO */
-	intptr_t len = utf16_to_utf8_filename(name, namelen, dirent->d_name, size);
+	intptr_t len;
+	if (flags & GETDENTS_UTF16)
+		len = utf16_to_utf8_filename(name, namelen, dirent->d_name, size);
+	else
+	{
+		len = namelen;
+		memcpy(dirent->d_name, name, namelen + 1);
+	}
 	/* Don't care much about the size, there is guaranteed to be enough room */
 	dirent->d_name[len] = 0;
 	dirent->d_name[len + 1] = type;
 	log_info("Added %s, inode = %llx, type = %d\n", dirent->d_name, inode, type);
-	dirent->d_reclen = (sizeof(struct linux_dirent64) + len + 1 + 8) & ~(uintptr_t)8;
+	dirent->d_reclen = (sizeof(struct linux_dirent) + len + 1 + 8) & ~(uintptr_t)8;
 	return dirent->d_reclen;
 }
 
-static intptr_t getdents64_fill(void *buffer, uint64_t inode, const wchar_t *name, int namelen, char type, size_t size)
+static intptr_t getdents64_fill(void *buffer, uint64_t inode, const void *name, int namelen, char type, size_t size, int flags)
 {
+	if (flags & GETDENTS_UTF8)
+	{
+		/* For UTF-8, check whether we have enough room */
+		int reclen = (sizeof(struct linux_dirent) + namelen + 1 + 8) & ~(uintptr_t)8;
+		if (size < reclen)
+			return GETDENTS_ERR_BUFFER_OVERFLOW;
+	}
 	struct linux_dirent64 *dirent = (struct linux_dirent64 *)buffer;
 	dirent->d_ino = inode;
 	dirent->d_off = 0; /* TODO */
 	dirent->d_type = type;
-	intptr_t len = utf16_to_utf8_filename(name, namelen, dirent->d_name, size);
+	intptr_t len;
+	if (flags & GETDENTS_UTF16)
+		len = utf16_to_utf8_filename(name, namelen, dirent->d_name, size);
+	else
+	{
+		len = namelen;
+		memcpy(dirent->d_name, name, namelen + 1);
+	}
 	/* Don't care much about the size, there is guaranteed to be enough room */
 	dirent->d_name[len] = 0;
 	log_info("Added %s, inode = %llx, type = %d\n", dirent->d_name, inode, type);
@@ -1039,11 +1332,15 @@ DEFINE_SYSCALL(getdents, int, fd, struct linux_dirent *, dirent, unsigned int, c
 	log_info("getdents(%d, %p, %d)\n", fd, dirent, count);
 	if (!mm_check_write(dirent, count))
 		return -EFAULT;
-	struct file *f = vfs->fds[fd];
+	struct file *f = vfs_get(fd);
+	int r;
 	if (f && f->op_vtable->getdents)
-		return f->op_vtable->getdents(f, dirent, count, getdents_fill);
+		r = f->op_vtable->getdents(f, dirent, count, getdents_fill);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(getdents64, int, fd, struct linux_dirent64 *, dirent, unsigned int, count)
@@ -1051,11 +1348,15 @@ DEFINE_SYSCALL(getdents64, int, fd, struct linux_dirent64 *, dirent, unsigned in
 	log_info("getdents64(%d, %p, %d)\n", fd, dirent, count);
 	if (!mm_check_write(dirent, count))
 		return -EFAULT;
-	struct file *f = vfs->fds[fd];
+	struct file *f = vfs_get(fd);
+	int r;
 	if (f && f->op_vtable->getdents)
-		return f->op_vtable->getdents(f, dirent, count, getdents64_fill);
+		r = f->op_vtable->getdents(f, dirent, count, getdents64_fill);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 static int stat_from_newstat(struct stat *stat, const struct newstat *newstat)
@@ -1108,30 +1409,38 @@ static int stat64_from_newstat(struct stat64 *stat, const struct newstat *newsta
 
 static int vfs_statat(int dirfd, const char *pathname, struct newstat *stat, int flags)
 {
+	int r = 0;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	if (flags & AT_NO_AUTOMOUNT)
 	{
 		log_error("AT_NO_AUTOMOUNT not supported.\n");
-		return -EINVAL;
+		r = -EINVAL;
+		goto out;
 	}
 	struct file *f;
 	if (flags & AT_EMPTY_PATH)
 	{
-		f = vfs_get(dirfd);
+		f = vfs_get_internal(dirfd);
 		if (!f)
-			return -EBADF;
-		vfs_ref(f);
+		{
+			r = -EBADF;
+			goto out;
+		}
 	}
 	else
 	{
 		int openflags = O_PATH;
 		if (flags & AT_SYMLINK_NOFOLLOW)
 			openflags |= O_NOFOLLOW;
-		int r = vfs_openat(dirfd, pathname, openflags, 0, &f);
+		r = vfs_openat(dirfd, pathname, openflags, 0, &f);
 		if (r < 0)
-			return r;
+			goto out;
 	}
-	int r = f->op_vtable->stat(f, stat);
+	r = f->op_vtable->stat(f, stat);
 	vfs_release(f);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -1177,7 +1486,6 @@ DEFINE_SYSCALL(fstatat64, int, dirfd, const char *, pathname, struct stat64 *, b
 	if (r)
 		return r;
 	return stat64_from_newstat(buf, &stat);
-
 }
 
 DEFINE_SYSCALL(fstat64, int, fd, struct stat64 *, buf)
@@ -1284,24 +1592,31 @@ static int statfs_from_statfs64(struct statfs *statfs, struct statfs64 *statfs64
 
 static int vfs_fstatfs(int fd, struct statfs64 *buf)
 {
-	struct file *f = vfs->fds[fd];
+	struct file *f = vfs_get(fd);
+	int r;
 	if (f && f->op_vtable->statfs)
-		return f->op_vtable->statfs(f, buf);
+		r = f->op_vtable->statfs(f, buf);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 static int vfs_statfs(const char *pathname, struct statfs64 *buf)
 {
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, pathname, O_PATH, 0, &f);
-	if (r)
-		return r;
-	if (f->op_vtable->statfs)
-		r = f->op_vtable->statfs(f, buf);
-	else
-		r = -EBADF;
-	vfs_release(f);
+	if (r == 0)
+	{
+		if (f->op_vtable->statfs)
+			r = f->op_vtable->statfs(f, buf);
+		else
+			r = -EBADF;
+		vfs_release(f);
+	}
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -1355,19 +1670,29 @@ DEFINE_SYSCALL(fadvise64_64, int, fd, loff_t, offset, loff_t, len, int, advice)
 	/* It seems windows does not support any of the fadvise semantics
 	 * We simply check the validity of parameters and return
 	 */
-	if (!vfs->fds[fd])
-		return -EBADF;
-	switch (advice)
+	int r;
+	struct file *f = vfs_get(fd);
+	if (!f)
+		r = -EBADF;
+	else
 	{
-	case POSIX_FADV_NORMAL:
-	case POSIX_FADV_RANDOM:
-	case POSIX_FADV_SEQUENTIAL:
-	case POSIX_FADV_WILLNEED:
-	case POSIX_FADV_DONTNEED:
-	case POSIX_FADV_NOREUSE:
-		return 0;
+		switch (advice)
+		{
+		case POSIX_FADV_NORMAL:
+		case POSIX_FADV_RANDOM:
+		case POSIX_FADV_SEQUENTIAL:
+		case POSIX_FADV_WILLNEED:
+		case POSIX_FADV_DONTNEED:
+		case POSIX_FADV_NOREUSE:
+			r = 0;
+			break;
+
+		default:
+			r = -EINVAL;
+		}
+		vfs_release(f);
 	}
-	return -EINVAL;
+	return r;
 }
 
 DEFINE_SYSCALL(fadvise64, int, fd, loff_t, offset, size_t, len, int, advice)
@@ -1378,11 +1703,19 @@ DEFINE_SYSCALL(fadvise64, int, fd, loff_t, offset, size_t, len, int, advice)
 DEFINE_SYSCALL(ioctl, int, fd, unsigned int, cmd, unsigned long, arg)
 {
 	log_info("ioctl(%d, %x, %x)\n", fd, cmd, arg);
-	struct file *f = vfs->fds[fd];
+	if (cmd == FIOCLEX)
+		return sys_fcntl(fd, F_SETFD, FD_CLOEXEC);
+	else if (cmd == FIONCLEX)
+		return sys_fcntl(fd, F_SETFD, 0);
+	struct file *f = vfs_get(fd);
+	int r;
 	if (f && f->op_vtable->ioctl)
-		return f->op_vtable->ioctl(f, cmd, arg);
+		r = f->op_vtable->ioctl(f, cmd, arg);
 	else
-		return -EBADF;
+		r = -EBADF;
+	if (f)
+		vfs_release(f);
+	return r;
 }
 
 DEFINE_SYSCALL(utime, const char *, filename, const struct utimbuf *, times)
@@ -1390,10 +1723,11 @@ DEFINE_SYSCALL(utime, const char *, filename, const struct utimbuf *, times)
 	log_info("utime(\"%s\", %p)\n", filename, times);
 	if (!mm_check_read_string(filename) || (times && !mm_check_read(times, sizeof(struct utimbuf))))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	if (!times)
 		r = f->op_vtable->utimens(f, NULL);
 	else
@@ -1406,6 +1740,9 @@ DEFINE_SYSCALL(utime, const char *, filename, const struct utimbuf *, times)
 		r = f->op_vtable->utimens(f, t);
 	}
 	vfs_release(f);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -1414,10 +1751,11 @@ DEFINE_SYSCALL(utimes, const char *, filename, const struct timeval *, times)
 	log_info("utimes(\"%s\", %p)\n", filename, times);
 	if (!mm_check_read_string(filename) || (times && !mm_check_read(times, 2 * sizeof(struct timeval))))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	if (!times)
 		r = f->op_vtable->utimens(f, NULL);
 	else
@@ -1428,6 +1766,8 @@ DEFINE_SYSCALL(utimes, const char *, filename, const struct timeval *, times)
 		r = f->op_vtable->utimens(f, t);
 	}
 	vfs_release(f);
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -1440,19 +1780,27 @@ DEFINE_SYSCALL(utimensat, int, dirfd, const char *, pathname, const struct times
 	{
 		/* Special case: use dirfd as file fd */
 		struct file *f = vfs_get(dirfd);
-		if (!f)
-			return -EBADF;
-		return f->op_vtable->utimens(f, times);
+		int r;
+		if (f && f->op_vtable->utimens)
+			r = f->op_vtable->utimens(f, times);
+		else
+			r = -EBADF;
+		if (f)
+			vfs_release(f);
+		return r;
 	}
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	int openflags = O_WRONLY | O_PATH;
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		openflags |= O_NOFOLLOW;
 	struct file *f;
 	int r = vfs_openat(dirfd, pathname, openflags, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	r = f->op_vtable->utimens(f, times);
 	vfs_release(f);
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
 	return r;
 }
 
@@ -1461,25 +1809,34 @@ DEFINE_SYSCALL(chdir, const char *, pathname)
 	log_info("chdir(%s)\n", pathname);
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
 	int r = vfs_openat(AT_FDCWD, pathname, O_PATH | O_DIRECTORY, 0, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	vfs_release(vfs->cwd);
 	vfs->cwd = f;
-	return 0;
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(fchdir, int, fd)
 {
 	log_info("fchdir(%d)\n", fd);
-	struct file *f = vfs_get(fd);
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	struct file *f = vfs_get_internal(fd);
+	int r = 0;
 	if (!f)
-		return -EBADF;
-	vfs_ref(f);
+	{
+		r = -EBADF;
+		goto out;
+	}
 	vfs_release(vfs->cwd);
 	vfs->cwd = f;
-	return 0;
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(getcwd, char *, buf, size_t, size)
@@ -1487,57 +1844,72 @@ DEFINE_SYSCALL(getcwd, char *, buf, size_t, size)
 	log_info("getcwd(%p, %p)\n", buf, size);
 	if (!mm_check_write(buf, size))
 		return -EFAULT;
+	AcquireSRWLockShared(&vfs->rw_lock);
 	char cwd[PATH_MAX];
-	int r = vfs->cwd->op_vtable->getpath(vfs->cwd, cwd);
+	intptr_t r = vfs->cwd->op_vtable->getpath(vfs->cwd, cwd);
 	if (size < r + 1)
-		return -ERANGE;
-	log_info("cwd: \"%s\"\n", cwd);
-	memcpy(buf, cwd, r + 1);
-	return buf;
+		r = -ERANGE;
+	else
+	{
+		log_info("cwd: \"%s\"\n", cwd);
+		memcpy(buf, cwd, r + 1);
+		r = (intptr_t)buf;
+	}
+	ReleaseSRWLockShared(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(fcntl, int, fd, int, cmd, int, arg)
 {
 	log_info("fcntl(%d, %d)\n", fd, cmd);
-	struct file *f = vfs->fds[fd];
-	if (!f)
-		return -EBADF;
-	switch (cmd)
-	{
-	case F_DUPFD:
+	if (cmd == F_DUPFD)
 		return sys_dup(fd);
-	case F_GETFD:
+	struct file *f = vfs_get(fd);
+	int r = 0;
+	if (!f)
+		r = -EBADF;
+	else
 	{
-		int cloexec = vfs->fds_cloexec[fd];
-		log_info("F_GETFD: CLOEXEC: %d\n", cloexec);
-		return cloexec? FD_CLOEXEC: 0;
+		/* TODO: Whether we need locking on reading/writing cloexec flag? */
+		switch (cmd)
+		{
+		case F_GETFD:
+		{
+			int cloexec = vfs->filed[fd].cloexec;
+			log_info("F_GETFD: CLOEXEC: %d\n", cloexec);
+			r = cloexec? FD_CLOEXEC: 0;
+			break;
+		}
+		case F_SETFD:
+		{
+			int cloexec = (arg & FD_CLOEXEC)? 1: 0;
+			log_info("F_SETFD: CLOEXEC: %d\n", cloexec);
+			vfs->filed[fd].cloexec = cloexec;
+			break;
+		}
+		case F_GETFL:
+		{
+			log_info("F_GETFL: %x\n", f->flags);
+			r = f->flags;
+			break;
+		}
+		case F_SETFL:
+		{
+			log_info("F_SETFL: 0%o\n", arg);
+			if ((arg & O_APPEND) || (arg & FASYNC) || (arg & O_DIRECT) || (arg & O_NOATIME))
+				log_error("flags contain unsupported bits.\n");
+			else
+				f->flags = (f->flags & ~O_NONBLOCK) | (arg & O_NONBLOCK);
+			break;
+		}
+		default:
+			log_error("Unsupported command: %d\n", cmd);
+			r = -EINVAL;
+			break;
+		}
+		vfs_release(f);
 	}
-	case F_SETFD:
-	{
-		int cloexec = (arg & FD_CLOEXEC)? 1: 0;
-		log_info("F_SETFD: CLOEXEC: %d\n", cloexec);
-		vfs->fds_cloexec[fd] = cloexec;
-		return 0;
-	}
-	case F_GETFL:
-	{
-		log_info("F_GETFL: %x\n", f->flags);
-		return f->flags;
-	}
-	case F_SETFL:
-	{
-		log_info("F_SETFL: 0%o\n", arg);
-		if ((arg & O_APPEND) || (arg & FASYNC) || (arg & O_DIRECT) || (arg & O_NOATIME))
-			log_error("flags contain unsupported bits.\n");
-		else
-			f->flags = (f->flags & ~O_NONBLOCK) | (arg & O_NONBLOCK);
-		return 0;
-	}
-
-	default:
-		log_error("Unsupported command: %d\n", cmd);
-		return -EINVAL;
-	}
+	return r;
 }
 
 DEFINE_SYSCALL(fcntl64, int, fd, int, cmd, int, arg)
@@ -1550,6 +1922,7 @@ DEFINE_SYSCALL(faccessat, int, dirfd, const char *, pathname, int, mode, int, fl
 	log_info("faccessat(%d, \"%s\", %d, %x)\n", dirfd, pathname, mode, flags);
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	int openflags = O_PATH;
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		openflags |= O_NOFOLLOW;
@@ -1557,9 +1930,11 @@ DEFINE_SYSCALL(faccessat, int, dirfd, const char *, pathname, int, mode, int, fl
 	struct file *f;
 	int r = vfs_openat(dirfd, pathname, openflags, mode, &f);
 	if (r < 0)
-		return r;
+		goto out;
 	vfs_release(f);
-	return 0;
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(access, const char *, pathname, int, mode)
@@ -1604,18 +1979,21 @@ DEFINE_SYSCALL(chroot, const char *, pathname)
 	log_info("chroot(\"%s\")\n", pathname);
 	if (!mm_check_read_string(pathname))
 		return -EFAULT;
+	AcquireSRWLockExclusive(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	int r = resolve_pathat(AT_FDCWD, pathname, realpath, &symlink_remain);
 	if (r < 0)
-		return r;
+		goto out;
 	log_info("resolved path: \"%s\"\n", realpath);
 	WCHAR wpath[PATH_MAX];
 	utf8_to_utf16_filename(realpath, r + 1, wpath, PATH_MAX);
 	/* TODO */
 	if (!SetCurrentDirectoryW(wpath + 1)) /* ignore the heading slash */
 		log_error("SetCurrentDirectoryW() failed, error code: %d\n", GetLastError());
-	return 0;
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
 }
 
 DEFINE_SYSCALL(fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flags)
@@ -1645,14 +2023,12 @@ DEFINE_SYSCALL(lchown, const char *, pathname, uid_t, owner, gid_t, group)
 	return sys_fchownat(AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
 }
 
-DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
+static int vfs_ppoll(struct linux_pollfd *fds, int nfds, int timeout, const sigset_t *sigmask)
 {
-	log_info("poll(0x%p, %d, %d)\n", fds, nfds, timeout);
-	if (!mm_check_write(fds, nfds * sizeof(struct linux_pollfd)))
-		return -EFAULT;
-
 	/* Count of handles to be waited on */
 	int cnt = 0;
+	/* File structures */
+	struct file **files = (struct file **)alloca(nfds * sizeof(struct file *));
 	/* Handles to be waited on */
 	HANDLE *handles = (HANDLE *)alloca(nfds * sizeof(HANDLE));
 	/* Indices of handles in the original fds[] array */
@@ -1667,8 +2043,11 @@ DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
 	for (int i = 0; i < nfds; i++)
 	{
 		if (fds[i].fd < 0)
+		{
+			files[i] = NULL;
 			continue;
-		struct file *f = vfs->fds[fds[i].fd];
+		}
+		struct file *f = files[i] = vfs_get(fds[i].fd);
 		/* TODO: Support for regular files */
 		if (!f)
 		{
@@ -1707,22 +2086,36 @@ DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
 	}
 	if (cnt && !done)
 	{
+		sigset_t oldmask;
+		if (sigmask)
+			signal_before_pwait(sigmask, &oldmask);
 		LARGE_INTEGER frequency, start;
 		QueryPerformanceFrequency(&frequency);
 		QueryPerformanceCounter(&start);
 		int remain = timeout;
 		for (;;)
 		{
-			DWORD result = WaitForMultipleObjects(cnt, handles, FALSE, remain);
+			DWORD result = signal_wait(cnt, handles, remain);
 			if (result == WAIT_TIMEOUT)
-				return 0;
+			{
+				num_result = 0;
+				goto out;
+			}
+			else if (result == WAIT_INTERRUPTED)
+			{
+				num_result = -EINTR;
+				goto out;
+			}
 			else if (result < WAIT_OBJECT_0 || result >= WAIT_OBJECT_0 + cnt)
-				return -ENOMEM; /* TODO: Find correct values */
+			{
+				num_result = -ENOMEM; /* TODO: Find correct errno */
+				goto out;
+			}
 			else
 			{
 				/* Wait successfully, fill in the revents field of that handle */
 				int id = indices[result - WAIT_OBJECT_0];
-				struct file *f = vfs->fds[fds[id].fd];
+				struct file *f = files[id];
 				/* Retrieve current event flags */
 				int e;
 				if (f->op_vtable->get_poll_status)
@@ -1738,9 +2131,9 @@ DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
 				if ((e & fds[id].events) == 0)
 				{
 					/*
-					 * Some file descriptors (console, socket) may be not readable even if it is signaled
-					 * Query the state again to make sure
-					 */
+					* Some file descriptors (console, socket) may be not readable even if it is signaled
+					* Query the state again to make sure
+					*/
 					LARGE_INTEGER current;
 					QueryPerformanceCounter(&current);
 					if (timeout != INFINITE)
@@ -1756,23 +2149,19 @@ DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
 				break;
 			}
 		}
+		if (sigmask)
+			signal_after_pwait(&oldmask);
 	}
+out:
+	for (int i = 0; i < nfds; i++)
+		if (files[i])
+			vfs_release(files[i]);
 	return num_result;
 }
 
-DEFINE_SYSCALL(select, int, nfds, struct fdset *, readfds, struct fdset *, writefds, struct fdset *, exceptfds, struct timeval *, timeout)
+static int vfs_pselect6(int nfds, struct fdset *readfds, struct fdset *writefds, struct fdset *exceptfds,
+	int timeout, const sigset_t *sigmask)
 {
-	log_info("select(%d, 0x%p, 0x%p, 0x%p, 0x%p)\n", nfds, readfds, writefds, exceptfds, timeout);
-	if ((readfds && !mm_check_write(readfds, sizeof(struct fdset)))
-		|| (writefds && !mm_check_write(writefds, sizeof(struct fdset)))
-		|| (exceptfds && !mm_check_write(exceptfds, sizeof(struct fdset)))
-		|| (timeout && !mm_check_read(timeout, sizeof(struct timeval))))
-		return -EFAULT;
-	int time;
-	if (timeout)
-		time = timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
-	else
-		time = -1;
 	int cnt = 0;
 	struct linux_pollfd *fds = (struct linux_pollfd *)alloca(sizeof(struct linux_pollfd) * nfds);
 	for (int i = 0; i < nfds; i++)
@@ -1791,7 +2180,7 @@ DEFINE_SYSCALL(select, int, nfds, struct fdset *, readfds, struct fdset *, write
 			cnt++;
 		}
 	}
-	int r = sys_poll(fds, cnt, time);
+	int r = vfs_ppoll(fds, cnt, timeout, sigmask);
 	if (r <= 0)
 		return r;
 	if (readfds)
@@ -1810,6 +2199,177 @@ DEFINE_SYSCALL(select, int, nfds, struct fdset *, readfds, struct fdset *, write
 			LINUX_FD_SET(fds[i].fd, exceptfds);
 	}
 	return r;
+}
+
+DEFINE_SYSCALL(poll, struct linux_pollfd *, fds, int, nfds, int, timeout)
+{
+	log_info("poll(0x%p, %d, %d)\n", fds, nfds, timeout);
+	if (!mm_check_write(fds, nfds * sizeof(struct linux_pollfd)))
+		return -EFAULT;
+	return vfs_ppoll(fds, nfds, timeout, NULL);
+}
+
+DEFINE_SYSCALL(ppoll, struct linux_pollfd *, fds, int, nfds, const struct timespec *, timeout_ts, const sigset_t *, sigmask, size_t, sigsetsize)
+{
+	log_info("ppoll(%p, %d, %p, %p)\n", fds, nfds, timeout_ts, sigmask);
+	if (sigsetsize != sizeof(sigset_t))
+		return -EINVAL;
+	if (timeout_ts && !mm_check_read(timeout_ts, sizeof(struct timespec)))
+		return -EFAULT;
+	if (sigmask && !mm_check_read(sigmask, sizeof(sigset_t)))
+		return -EFAULT;
+	int timeout = timeout_ts == NULL ? -1 : (timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000);
+	return vfs_ppoll(fds, nfds, timeout, sigmask);
+}
+
+DEFINE_SYSCALL(select, int, nfds, struct fdset *, readfds, struct fdset *, writefds, struct fdset *, exceptfds, struct timeval *, timeout)
+{
+	log_info("select(%d, 0x%p, 0x%p, 0x%p, 0x%p)\n", nfds, readfds, writefds, exceptfds, timeout);
+	if ((readfds && !mm_check_write(readfds, sizeof(struct fdset)))
+		|| (writefds && !mm_check_write(writefds, sizeof(struct fdset)))
+		|| (exceptfds && !mm_check_write(exceptfds, sizeof(struct fdset)))
+		|| (timeout && !mm_check_read(timeout, sizeof(struct timeval))))
+		return -EFAULT;
+	int time;
+	if (timeout)
+		time = timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
+	else
+		time = -1;
+	return vfs_pselect6(nfds, readfds, writefds, exceptfds, time, NULL);
+}
+
+DEFINE_SYSCALL(pselect6, int, nfds, struct fdset *, readfds, struct fdset *, writefds, struct fdset *, exceptfds,
+	const struct timespec *, timeout_ts, void *, sigmask_data)
+{
+	struct sigmask_data
+	{
+		const sigset_t *sigmask;
+		size_t sigsetlen;
+	} *sd;
+	if (!mm_check_read(sigmask_data, sizeof(sigmask_data)))
+		return -EFAULT;
+	sd = (struct sigmask_data *)sigmask_data;
+	if (sd->sigsetlen != sizeof(sigset_t))
+		return -EINVAL;
+	const sigset_t *sigmask = sd->sigmask;
+	log_info("pselect6(%d, %p, %p, %p, %p, %p)\n", nfds, readfds, writefds, exceptfds, timeout_ts, sigmask);
+	if ((readfds && !mm_check_write(readfds, sizeof(struct fdset)))
+		|| (writefds && !mm_check_write(writefds, sizeof(struct fdset)))
+		|| (exceptfds && !mm_check_write(exceptfds, sizeof(struct fdset)))
+		|| (timeout_ts && !mm_check_read(timeout_ts, sizeof(struct timespec)))
+		|| (sigmask && !mm_check_read(sigmask, sizeof(sigset_t))))
+		return -EFAULT;
+	int timeout = timeout_ts == NULL ? -1 : (timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000);
+	return vfs_pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask);
+}
+
+DEFINE_SYSCALL(epoll_create1, int, flags)
+{
+	log_info("epoll_create1(%d)\n", flags);
+
+	AcquireSRWLockExclusive(&vfs->rw_lock);
+	struct file *epollfd;
+	int r = epollfd_alloc(&epollfd);
+	if (r)
+		goto out;
+	r = store_file_internal(epollfd, (flags & EPOLL_CLOEXEC) > 0);
+	if (r < 0)
+		vfs_release(epollfd);
+
+out:
+	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	return r;
+}
+
+DEFINE_SYSCALL(epoll_create, int, size)
+{
+	log_info("epoll_create(%d)\n", size);
+	if (size <= 0)
+		return -EINVAL;
+	return sys_epoll_create1(0);
+}
+
+DEFINE_SYSCALL(epoll_ctl, int, epfd, int, op, int, fd, struct epoll_event *, event)
+{
+	log_info("epoll_ctl(epfd=%d, op=%d, fd=%d, epoll_event=%p)\n", epfd, op, fd, event);
+	if (!mm_check_read(event, sizeof(struct epoll_event)))
+		return -EINVAL;
+	if ((event->events & EPOLLET))
+	{
+		log_error("Edge triggered epoll is not supported.\n");
+		return -EINVAL;
+	}
+	int r = 0;
+	struct file *f = vfs_get(epfd);
+	if (!f || !epollfd_is_epollfd(f))
+	{
+		r = -EBADF;
+		goto out;
+	}
+	struct file *mf = vfs_get(fd);
+	if (!mf)
+	{
+		r = -EBADF;
+		goto out;
+	}
+	switch (op)
+	{
+	case EPOLL_CTL_ADD:
+	{
+		r = epollfd_ctl_add(f, fd, event);
+		break;
+	}
+	case EPOLL_CTL_DEL:
+	{
+		r = epollfd_ctl_del(f, fd);
+		break;
+	}
+	case EPOLL_CTL_MOD:
+	{
+		r = epollfd_ctl_mod(f, fd, event);
+		break;
+	}
+	default:
+		r = -EINVAL;
+	}
+out:
+	if (mf)
+		vfs_release(mf);
+	if (f)
+		vfs_release(f);
+	return r;
+}
+
+DEFINE_SYSCALL(epoll_pwait, int, epfd, struct epoll_event *, events, int, maxevents, int, timeout, const sigset_t *, sigmask)
+{
+	log_info("epoll_pwait(%d, %p, %d, %d, %p)\n", epfd, events, maxevents, timeout, sigmask);
+	if (!mm_check_write(events, sizeof(struct epoll_event) * maxevents))
+		return -EFAULT;
+	if (sigmask && !mm_check_read(sigmask, sizeof(sigset_t)))
+		return -EFAULT;
+	struct file *f = vfs_get(epfd);
+	int r;
+	if (!f || !epollfd_is_epollfd(f))
+	{
+		r = -EBADF;
+		goto out;
+	}
+	int nfds = epollfd_get_nfds(f);
+	struct linux_pollfd *pollfds = (struct linux_pollfd *)alloca(sizeof(struct linux_pollfd) * nfds);
+	epollfd_to_pollfds(f, pollfds);
+	r = vfs_ppoll(pollfds, nfds, timeout, sigmask);
+	if (r < 0)
+		goto out;
+	r = epollfd_to_events(f, pollfds, events, maxevents);
+out:
+	if (f)
+		vfs_release(f);
+	return r;
+}
+
+DEFINE_SYSCALL(epoll_wait, int, epfd, struct epoll_event *, events, int, maxevents, int, timeout)
+{
+	return sys_epoll_pwait(epfd, events, maxevents, timeout, NULL);
 }
 
 DEFINE_SYSCALL(getxattr, const char *, path, const char *, name, void *, value, size_t, size)
@@ -1893,5 +2453,12 @@ DEFINE_SYSCALL(fremovexattr, int, fd, const char *, name)
 {
 	log_info("fremovexattr(%d, \"%s\")\n", fd, name);
 	log_warning("fremovexattr() not implemented.\n");
+	return -EOPNOTSUPP;
+}
+
+DEFINE_SYSCALL(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len) 
+{
+	log_info("fallocate(%d, %d, %d, %d)\n", fd, mode, offset, len);
+	log_warning("fallocate() not implemented.\n");
 	return -EOPNOTSUPP;
 }

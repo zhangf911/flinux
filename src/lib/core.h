@@ -17,9 +17,9 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <common/poll.h>
+#pragma once
 
-int fhelper_get_poll_status_inout(struct file *f)
-{
-	return LINUX_POLLIN | LINUX_POLLOUT;
-}
+#include <stddef.h>
+
+#define container_of(ptr, type, member) \
+	((type *)((char *)(ptr) - offsetof(type, member)))

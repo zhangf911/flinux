@@ -33,13 +33,9 @@ DEFINE_SYSCALL(time, intptr_t *, c)
 	log_info("time(%p)\n", c);
 	if (c && !mm_check_write(c, sizeof(int)))
 		return -EFAULT;
-	SYSTEMTIME systime;
-	GetSystemTime(&systime);
-	uint64_t t = (uint64_t)systime.wSecond + (uint64_t)systime.wMinute * 60
-		+ (uint64_t)systime.wHour * 3600 + (uint64_t)systime.wDay * 86400
-		+ ((uint64_t)systime.wYear - 70) * 31536000 + (((uint64_t)systime.wYear - 69) / 4) * 86400
-		- (((uint64_t)systime.wYear - 1) / 100) * 86400 + (((uint64_t)systime.wYear + 299) / 400) * 86400;
-
+	FILETIME systime;
+	GetSystemTimeAsFileTime(&systime);
+	uint64_t t = filetime_to_unix_sec(&systime);
 	if (c)
 		*c = (intptr_t)t;
 	return t;
@@ -66,7 +62,7 @@ DEFINE_SYSCALL(nanosleep, const struct timespec *, req, struct timespec *, rem)
 	if (!mm_check_read(req, sizeof(struct timespec)) || rem && !mm_check_write(rem, sizeof(struct timespec)))
 		return -EFAULT;
 	LARGE_INTEGER delay_interval;
-	delay_interval.QuadPart = ((uint64_t)req->tv_sec * 1000000000ULL + req->tv_nsec) / 100ULL;
+	delay_interval.QuadPart = 0ULL - (((uint64_t)req->tv_sec * 1000000000ULL + req->tv_nsec) / 100ULL);
 	NtDelayExecution(FALSE, &delay_interval);
 	return 0;
 }
@@ -87,6 +83,8 @@ DEFINE_SYSCALL(clock_gettime, int, clk_id, struct timespec *, tp)
 		return 0;
 	}
 	case CLOCK_MONOTONIC:
+	case CLOCK_MONOTONIC_COARSE:
+	case CLOCK_MONOTONIC_RAW:
 	{
 		LARGE_INTEGER freq, counter;
 		QueryPerformanceFrequency(&freq);
@@ -118,6 +116,8 @@ DEFINE_SYSCALL(clock_getres, int, clk_id, struct timespec *, res)
 		return 0;
 	}
 	case CLOCK_MONOTONIC:
+	case CLOCK_MONOTONIC_COARSE:
+	case CLOCK_MONOTONIC_RAW:
 	{
 		LARGE_INTEGER freq;
 		QueryPerformanceFrequency(&freq);
@@ -137,4 +137,46 @@ DEFINE_SYSCALL(clock_getres, int, clk_id, struct timespec *, res)
 	default:
 		return -EINVAL;
 	}
+}
+
+DEFINE_SYSCALL(setitimer, int, which, const struct itimerval *, new_value, struct itimerval *, old_value)
+{
+	log_info("setitimer(%d, %p, %p)\n", which, new_value, old_value);
+	log_error("setitimer() not implemented.\n");
+	return 0;
+}
+
+DEFINE_SYSCALL(timer_create, clockid_t, which_clock, struct sigevent *, timer_event_spec, timer_t, created_timer_id)
+{
+	log_info("timer_create(%d, %p, %p)\n", which_clock, timer_event_spec, created_timer_id);
+	log_error("timer_create() not implemented.\n");
+	return 0;
+}
+
+DEFINE_SYSCALL(timer_settime, timer_t, timer_id, int, flags, const struct itimerspec *, new_setting, struct itimerspec *, old_setting)
+{
+	log_info("timer_settime(%d, 0x%x, %p, %p)\n", timer_id, flags, new_setting, old_setting);
+	log_error("timer_settime() not implemented.\n");
+	return 0;
+}
+
+DEFINE_SYSCALL(timer_gettime, timer_t, timer_id, struct itimerspec *, setting)
+{
+	log_info("timer_gettime(%d, %p)\n", timer_id, setting);
+	log_error("timer_gettime() not implemented.\n");
+	return 0;
+}
+
+DEFINE_SYSCALL(timer_getoverrun, timer_t, timer_id)
+{
+	log_info("timer_getoverrun(%d)\n", timer_id);
+	log_error("timer_getoverrun() not implemented.\n");
+	return 0;
+}
+
+DEFINE_SYSCALL(timer_delete, timer_t, timer_id)
+{
+	log_info("timer_delete(%d)\n", timer_id);
+	log_error("timer_delete() not implemented.\n");
+	return 0;
 }

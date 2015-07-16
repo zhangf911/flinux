@@ -22,6 +22,7 @@
 #include <syscall/fork.h>
 #include <syscall/mm.h>
 #include <syscall/process.h>
+#include <syscall/sig.h>
 #include <syscall/tls.h>
 #include <syscall/vfs.h>
 #include <log.h>
@@ -40,9 +41,8 @@
  * This is to prevent data corruption when the arguments of execve() used pointers at data inside the startup area
  * The first uintptr_t data itme in each side is set to 1 when the part is currently in use
  */
-static char *const startup = (char *)STARTUP_DATA_BASE;
+char *startup;
 
-#define ALIGN_TO(x, a) ((uintptr_t)((x) + (a) - 1) & -(a))
 #define ENV(x) \
 	do { \
 		memcpy(envbuf, x, sizeof(x) + 1); \
@@ -58,10 +58,11 @@ void main()
 	mm_init();
 	install_syscall_handler();
 	heap_init();
-	vfs_init();
+	signal_init();
+	process_init();
 	tls_init();
+	vfs_init();
 	dbt_init();
-	process_init(NULL);
 
 	/* Parse command line */
 	const char *cmdline = GetCommandLineA();
@@ -69,10 +70,11 @@ void main()
 	if (len > BLOCK_SIZE) /* TODO: Test if there is sufficient space for argv[] array */
 	{
 		kprintf("Command line too long.\n");
-		ExitProcess(1);
+		process_exit(1, 0);
 	}
 
-	mm_mmap(STARTUP_DATA_BASE, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, 0, NULL, 0);
+	startup = mm_mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS,
+		INTERNAL_MAP_TOPDOWN | INTERNAL_MAP_NORESET, NULL, 0);
 	*(uintptr_t*) startup = 1;
 	char *current_startup_base = startup + sizeof(uintptr_t);
 	memcpy(current_startup_base, cmdline, len + 1);
@@ -83,12 +85,14 @@ void main()
 	ENV("HOME=/root");
 	char *env2 = envbuf;
 	ENV("DISPLAY=127.0.0.1:0");
+	char *env3 = envbuf;
+	ENV("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:/sbin");
 	int argc = 0;
-	const char **argv = (const char **)ALIGN_TO(envbuf, sizeof(void*));
+	char **argv = (char **)ALIGN_TO(envbuf, sizeof(void*));
 
 	/* Parse command line */
 	int in_quote = 0;
-	const char *j = current_startup_base;
+	char *j = current_startup_base;
 	for (char *i = current_startup_base; i <= current_startup_base + len; i++)
 		if (!in_quote && (*i == ' ' || *i == '\t' || *i == '\r' || *i == '\n' || *i == 0))
 		{
@@ -106,12 +110,13 @@ void main()
 			j = i + 1;
 		}
 	argv[argc] = NULL;
-	const char **envp = argv + argc + 1;
-	int env_size = 3;
+	char **envp = argv + argc + 1;
+	int env_size = 4;
 	envp[0] = env0;
 	envp[1] = env1;
 	envp[2] = env2;
-	envp[3] = NULL;
+	envp[3] = env3;
+	envp[4] = NULL;
 	char *buffer_base = (char*)(envp + env_size + 1);
 
 	const char *filename = NULL;
@@ -124,7 +129,7 @@ void main()
 			filename = argv[i];
 	}
 	if (filename)
-		do_execve(filename, argc - 1, argv + 1, env_size, envp, buffer_base);
+		do_execve(filename, argc - 1, argv + 1, env_size, envp, buffer_base, NULL);
 	kprintf("Usage: flinux <executable> [arguments]\n");
-	ExitProcess(1);
+	process_exit(1, 0);
 }

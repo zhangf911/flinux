@@ -28,18 +28,23 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
-typedef intptr_t getdents_callback(void *buffer, uint64_t inode, const wchar_t *name, int namelen, char type, size_t size);
+#define GETDENTS_UTF8	1
+#define GETDENTS_UTF16	2
+
+#define GETDENTS_ERR_BUFFER_OVERFLOW	-100
+typedef intptr_t getdents_callback(void *buffer, uint64_t inode, const void *name, int namelen, char type, size_t size, int flags);
 
 struct file_ops
 {
 	int (*get_poll_status)(struct file *f);
 	HANDLE (*get_poll_handle)(struct file *f, int *poll_events);
+	void (*after_fork)(struct file *f);
 	int (*close)(struct file *f);
 	int (*getpath)(struct file *f, char *buf);
-	size_t (*read)(struct file *f, char *buf, size_t count);
-	size_t (*write)(struct file *f, const char *buf, size_t count);
-	size_t (*pread)(struct file *f, char *buf, size_t count, loff_t offset);
-	size_t (*pwrite)(struct file *f, const char *buf, size_t count, loff_t offset);
+	size_t (*read)(struct file *f, void *buf, size_t count);
+	size_t (*write)(struct file *f, const void *buf, size_t count);
+	size_t (*pread)(struct file *f, void *buf, size_t count, loff_t offset);
+	size_t (*pwrite)(struct file *f, const void *buf, size_t count, loff_t offset);
 	size_t (*readlink)(struct file *f, char *buf, size_t bufsize);
 	int (*truncate)(struct file *f, loff_t length);
 	int (*fsync)(struct file *f);
@@ -54,21 +59,28 @@ struct file_ops
 struct file
 {
 	const struct file_ops *op_vtable;
-	uint32_t ref;
 	int flags;
+	uint32_t ref;
+	SRWLOCK rw_lock;
 };
+
+static void file_init(struct file *f, const struct file_ops *op_vtable, int flags)
+{
+	f->op_vtable = op_vtable;
+	f->flags = flags;
+	f->ref = 1;
+	InitializeSRWLock(&f->rw_lock);
+}
 
 struct file_system
 {
 	struct file_system *next;
-	char *mountpoint;
-	int (*open)(const char *path, int flags, int mode, struct file **fp, char *target, int buflen);
-	int (*symlink)(const char *target, const char *linkpath);
-	int (*link)(struct file *f, const char *newpath);
-	int (*unlink)(const char *pathname);
-	int (*rename)(struct file *f, const char *newpath);
-	int (*mkdir)(const char *pathname, int mode);
-	int (*rmdir)(const char *pathname);
+	const char *mountpoint;
+	int (*open)(struct file_system *fs, const char *path, int flags, int mode, struct file **fp, char *target, int buflen);
+	int (*symlink)(struct file_system *fs, const char *target, const char *linkpath);
+	int (*link)(struct file_system *fs, struct file *f, const char *newpath);
+	int (*unlink)(struct file_system *fs, const char *pathname);
+	int (*rename)(struct file_system *fs, struct file *f, const char *newpath);
+	int (*mkdir)(struct file_system *fs, const char *pathname, int mode);
+	int (*rmdir)(struct file_system *fs, const char *pathname);
 };
-
-int fhelper_get_poll_status_inout(struct file *f); /* get_poll_status: Always POLLIN | POLLOUT */
